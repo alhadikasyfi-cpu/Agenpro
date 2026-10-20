@@ -1,18 +1,30 @@
 /**
  * Lapak Sawit Feature Analysis — Google Apps Script
  * Duplicates the SawitPRO master template (slide 1) and renders a feature analysis snapshot:
- * KPI cards, stage-by-stage funnel, DAU trend chart and Gemini-generated insights.
+ * KPI cards, DAU → feature funnel, daily trend chart and Gemini-generated insights.
+ *
+ * Source: sheet "Daily Metrics", one row per date (and feature). Rows are read from row 2 down to
+ * the first empty row; columns are matched by header name, so their order does not matter.
  */
 
 const LS_CONFIG = {
   GEMINI_MODEL: 'gemini-3.5-flash-lite',
   PRESENTATION_PROPERTY: 'LAPAK_SAWIT_PRESENTATION_ID',
   API_KEY_PROPERTY: 'GEMINI_API_KEY',
-  SHEET_EVENTS: 'Events',
   SHEET_DAILY: 'Daily Metrics',
   SHEET_LOG: 'Run Log',
-  TITLE: 'Lapak Sawit Feature Analysis',
+  FEATURE_NAME: 'Lapak Sawit',
   FONT: 'Arial',
+
+  // Accepted header names per field (lower-case). Optional fields may be absent.
+  DAILY_COLUMNS: {
+    date: ['tanggal', 'date'],
+    feature: ['feature_name', 'feature'],
+    dau: ['daily_active_users', 'dau'],
+    featureUsers: ['feature_unique_users', 'feature_users', 'unique_users'],
+    penetration: ['penetration_rate_pct', 'penetration_pct', 'penetration']
+  },
+  REQUIRED_COLUMNS: ['date', 'dau', 'featureUsers'],
 
   // Slides text boxes carry built-in padding that SlidesApp cannot change.
   // addText_ expands every box by these insets so text lands exactly on the layout grid.
@@ -26,6 +38,7 @@ const LS_CONFIG = {
   COLORS: {
     greenDark: '#31512B',
     greenMid: '#49663D',
+    greenBar: '#6E9A5E',
     greenSoft: '#EEF4EA',
     greenMuted: '#C9DCC1',
     yellow: '#FFD400',
@@ -48,14 +61,6 @@ const LS_CONFIG = {
     cardBg: '#F8FAFC',
     white: '#FFFFFF'
   },
-  // One shade per funnel stage, darkest at the top of the funnel
-  FUNNEL_COLORS: ['#31512B', '#4A7340', '#6E9A5E', '#9CBF8C'],
-  FUNNEL_STAGES: [
-    { name: 'Home Open', aliases: ['home open', 'home_open', 'home_opened'] },
-    { name: 'Daftar RAM', aliases: ['daftar ram', 'daftar_ram', 'ram registration'] },
-    { name: 'Jual TBS', aliases: ['jual tbs', 'jual_tbs', 'sell ffb'] },
-    { name: 'Permintaan Penjemputan', aliases: ['permintaan penjemputan', 'permintaan_penjemputan', 'pickup request'] }
-  ],
 
   // Layout grid in points for a 16:9 slide (720 x 405 pt).
   // Content stays between the template header line (~50pt) and the footer bar (~370pt).
@@ -82,23 +87,17 @@ function onOpen() {
 
 function setupLapakSawit() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const events = getOrCreateSheet_(ss, LS_CONFIG.SHEET_EVENTS);
   const daily = getOrCreateSheet_(ss, LS_CONFIG.SHEET_DAILY);
   const log = getOrCreateSheet_(ss, LS_CONFIG.SHEET_LOG);
 
-  setupTab_(events, ['date', 'event_name', 'event_count'], [
-    ['2026-10-01', 'Home Open', 120],
-    ['2026-10-01', 'Daftar RAM', 18],
-    ['2026-10-01', 'Jual TBS', 3],
-    ['2026-10-01', 'Permintaan Penjemputan', 0]
-  ]);
-  setupTab_(daily, ['date', 'dau', 'returning_users', 'new_users'], [
-    ['2026-10-01', 120, 42, 78],
-    ['2026-10-02', 135, 48, 87],
-    ['2026-10-03', 128, 45, 83]
+  setupTab_(daily, ['tanggal', 'feature_name', 'daily_active_users', 'feature_unique_users', 'penetration_rate_pct'], [
+    [20261018, 'Lapak Sawit', 172, 4, 2.33],
+    [20261017, 'Lapak Sawit', 176, 3, 1.7],
+    [20261016, 'Lapak Sawit', 234, 10, 4.27],
+    [20261015, 'Lapak Sawit', 205, 5, 2.44]
   ]);
   setupTab_(log, ['run_at', 'status', 'message', 'presentation_url'], []);
-  [events, daily, log].forEach(sh => {
+  [daily, log].forEach(sh => {
     sh.setFrozenRows(1);
     sh.autoResizeColumns(1, sh.getLastColumn());
   });
@@ -137,10 +136,8 @@ function generateLapakSawitSlide() {
   let presentationUrl = '';
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const events = readEvents_(ss);
-    const daily = readDailyMetrics_(ss);
-
-    const analysisInput = buildAnalysisInput_(events, daily);
+    const rows = readDailyMetrics_(ss);
+    const analysisInput = buildAnalysisInput_(rows);
     const ai = callGemini_(analysisInput);
 
     const presentation = getOrCreatePresentation_();
@@ -159,9 +156,14 @@ function generateLapakSawitSlide() {
     }
 
     presentationUrl = 'https://docs.google.com/presentation/d/' + presentation.getId() + '/edit';
-    logRun_(ss, 'SUCCESS', 'Slide generated successfully.', presentationUrl);
+    const issues = analysisInput.dataQualityIssues;
+    const message = 'Slide generated (' + analysisInput.dataPeriod.days + ' days).' +
+      (issues.length ? ' Data warnings: ' + issues.join('; ') : '');
+    logRun_(ss, issues.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);
 
-    SpreadsheetApp.getUi().alert('Slide generated successfully!\n\nOpen presentation:\n' + presentationUrl);
+    SpreadsheetApp.getUi().alert('Slide generated successfully!' +
+      (issues.length ? '\n\n' + issues.length + ' data warning(s), see Run Log.' : '') +
+      '\n\nOpen presentation:\n' + presentationUrl);
   } catch (err) {
     try {
       const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -188,42 +190,50 @@ function setupTab_(sheet, headers, sampleRows) {
   sheet.getRange(1, 1, 1, headers.length).setBackground(LS_CONFIG.COLORS.greenDark).setFontColor('#FFFFFF').setFontWeight('bold');
 }
 
-function readTable_(sheetName, requiredHeaders) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-  if (!sheet) throw new Error('Missing sheet "' + sheetName + '".');
-  const values = sheet.getDataRange().getValues();
-  if (values.length < 2) return [];
-  const headers = values[0].map(v => String(v).trim().toLowerCase());
-  const indexes = {};
-  requiredHeaders.forEach(h => {
-    const idx = headers.indexOf(h);
-    if (idx < 0) throw new Error('Sheet missing header "' + h + '".');
-    indexes[h] = idx;
-  });
-  return values.slice(1).filter(row => row.some(v => v !== '' && v !== null)).map(row => {
-    const out = {};
-    requiredHeaders.forEach(h => out[h] = row[indexes[h]]);
-    return out;
-  });
-}
-
-function readEvents_(ss) {
-  return readTable_(LS_CONFIG.SHEET_EVENTS, ['date', 'event_name', 'event_count'])
-    .map(r => ({ date: parseDate_(r.date), eventName: String(r.event_name || '').trim(), eventCount: toNumber_(r.event_count) }))
-    .filter(r => r.date && r.eventName);
-}
-
+/** Reads "Daily Metrics" from row 2 down to the first fully empty row; columns are located by header name. */
 function readDailyMetrics_(ss) {
-  return readTable_(LS_CONFIG.SHEET_DAILY, ['date', 'dau', 'returning_users', 'new_users'])
-    .map(r => ({ date: parseDate_(r.date), dau: toNumber_(r.dau), returningUsers: toNumber_(r.returning_users), newUsers: toNumber_(r.new_users) }))
-    .filter(r => r.date);
+  const sheetName = LS_CONFIG.SHEET_DAILY;
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error('Missing sheet "' + sheetName + '".');
+  const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  if (lastRow < 2) throw new Error('Sheet "' + sheetName + '" has no data rows.');
+
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = values[0].map(v => String(v).trim().toLowerCase());
+  const col = {};
+  Object.keys(LS_CONFIG.DAILY_COLUMNS).forEach(field => {
+    const names = LS_CONFIG.DAILY_COLUMNS[field];
+    col[field] = headers.findIndex(h => names.indexOf(h) >= 0);
+  });
+  LS_CONFIG.REQUIRED_COLUMNS.forEach(field => {
+    if (col[field] < 0) {
+      throw new Error('Sheet "' + sheetName + '" is missing column "' + LS_CONFIG.DAILY_COLUMNS[field].join('" / "') + '".');
+    }
+  });
+
+  const rows = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (row.every(v => v === '' || v === null)) break; // data ends at the first empty row
+    rows.push({
+      rowNumber: r + 1,
+      date: parseDate_(row[col.date]),
+      feature: col.feature >= 0 ? String(row[col.feature] || '').trim() : '',
+      dau: toNumber_(row[col.dau]),
+      featureUsers: toNumber_(row[col.featureUsers]),
+      penetration: col.penetration >= 0 && row[col.penetration] !== '' ? toNumber_(row[col.penetration]) : null
+    });
+  }
+  if (!rows.length) throw new Error('Sheet "' + sheetName + '" has no data before the first empty row.');
+  return rows;
 }
 
+/** Accepts real dates, yyyyMMdd (number or text) and yyyy-MM-dd. */
 function parseDate_(value) {
   if (value instanceof Date && !isNaN(value.getTime())) return new Date(value.getFullYear(), value.getMonth(), value.getDate());
-  if (!value) return null;
+  if (value === '' || value == null) return null;
   const s = String(value).trim();
-  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  let m = s.match(/^(\d{4})(\d{2})(\d{2})$/) || s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -234,71 +244,153 @@ function toNumber_(value) {
   return isFinite(n) ? n : 0;
 }
 
-function buildAnalysisInput_(events, daily) {
-  const stages = LS_CONFIG.FUNNEL_STAGES.map(stage => {
-    const aliases = stage.aliases.map(normalizeEvent_);
-    const matching = events.filter(e => aliases.indexOf(normalizeEvent_(e.eventName)) >= 0);
-    const total = matching.reduce((sum, e) => sum + e.eventCount, 0);
-    return { name: stage.name, eventCount: total };
-  });
+/** Keeps the rows of the configured feature (or the only feature present). */
+function selectFeatureRows_(rows) {
+  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const names = rows.map(r => r.feature).filter(Boolean).filter((n, i, all) => all.findIndex(x => norm(x) === norm(n)) === i);
+  const target = norm(LS_CONFIG.FEATURE_NAME);
+  if (!names.length) return { feature: LS_CONFIG.FEATURE_NAME, rows: rows };
+  const match = names.find(n => norm(n) === target);
+  if (match) return { feature: match, rows: rows.filter(r => !r.feature || norm(r.feature) === target) };
+  if (names.length === 1) return { feature: names[0], rows: rows };
+  throw new Error('Feature "' + LS_CONFIG.FEATURE_NAME + '" not found. Features in sheet: ' + names.join(', '));
+}
 
-  const top = stages[0].eventCount;
-  stages.forEach((stage, i) => {
-    const prev = i > 0 ? stages[i - 1].eventCount : null;
-    stage.stepConversionPct = i === 0 ? 100 : (prev > 0 ? round1_((stage.eventCount / prev) * 100) : null);
-    stage.shareOfTopPct = top > 0 ? round1_((stage.eventCount / top) * 100) : null;
-    stage.lostFromPrev = i === 0 ? 0 : Math.max(0, prev - stage.eventCount);
-  });
+function buildAnalysisInput_(rawRows) {
+  const issues = [];
+  const selected = selectFeatureRows_(rawRows);
 
-  // Largest leak = the step that loses the most events in absolute terms
-  let largestLeakIndex = -1;
-  stages.forEach((stage, i) => {
-    if (i > 0 && stage.lostFromPrev > 0 && (largestLeakIndex < 0 || stage.lostFromPrev > stages[largestLeakIndex].lostFromPrev)) {
-      largestLeakIndex = i;
+  // One row per date, validated
+  const byDate = {};
+  selected.rows.forEach(r => {
+    if (!r.date) {
+      issues.push('Row ' + r.rowNumber + ': unreadable date (row skipped)');
+      return;
     }
+    const key = dateKey_(r.date);
+    if (byDate[key]) {
+      issues.push('Duplicate date ' + key + ' (row ' + r.rowNumber + ' skipped)');
+      return;
+    }
+    const penetrationPct = r.dau > 0 ? round2_((r.featureUsers / r.dau) * 100) : null;
+    if (r.featureUsers > r.dau) issues.push(key + ': feature users (' + r.featureUsers + ') exceed DAU (' + r.dau + ')');
+    if (r.penetration != null && penetrationPct != null && Math.abs(r.penetration - penetrationPct) > 0.05) {
+      issues.push(key + ': penetration_rate_pct ' + r.penetration + ' differs from computed ' + penetrationPct);
+    }
+    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, penetrationPct: penetrationPct };
   });
 
-  const sorted = daily.slice().sort((a, b) => a.date.getTime() - b.date.getTime());
-  const series = sorted.map(r => ({
-    date: dateKey_(r.date),
-    dau: r.dau,
-    returningUsers: r.returningUsers,
-    newUsers: r.newUsers
-  }));
-  if (!series.length) throw new Error('Sheet "' + LS_CONFIG.SHEET_DAILY + '" has no valid rows.');
+  const series = Object.keys(byDate).sort().map(k => byDate[k]);
+  if (!series.length) throw new Error('No valid rows for feature "' + selected.feature + '".');
 
-  const sum = key => series.reduce((acc, r) => acc + r[key], 0);
   const days = series.length;
-  const totalUsers = sum('newUsers') + sum('returningUsers');
-  const last = stages[stages.length - 1].eventCount;
+  const start = series[0].date, end = series[days - 1].date;
+  const spanDays = Math.round((parseDate_(end).getTime() - parseDate_(start).getTime()) / 86400000) + 1;
+  if (spanDays > days) issues.push((spanDays - days) + ' missing date(s) between ' + start + ' and ' + end);
+
+  const sum = (rows, key) => rows.reduce((acc, r) => acc + r[key], 0);
+  const totalDau = sum(series, 'dau');
+  const totalFeatureUsers = sum(series, 'featureUsers');
+  const penetrationPct = totalDau > 0 ? round2_((totalFeatureUsers / totalDau) * 100) : null;
+  const withPen = series.filter(r => r.penetrationPct != null);
+  const pick = (rows, better) => rows.reduce((best, r) => (best == null || better(r, best) ? r : best), null);
 
   return {
-    dataPeriod: { start: series[0].date, end: series[days - 1].date },
+    feature: selected.feature,
+    funnelDefinition: 'Step 1 = app Daily Active Users (DAU); Step 2 = users who clicked/opened the feature (feature_unique_users). Conversion = penetration = feature users / DAU.',
+    unitsNote: 'Totals of feature users are user-days (sum of daily unique users), not unique users across the whole period.',
+    dataPeriod: { start: start, end: end, days: days, calendarDays: spanDays },
     summary: {
-      avgDau: Math.round(sum('dau') / days),
-      avgNewUsers: Math.round(sum('newUsers') / days),
-      avgReturningUsers: Math.round(sum('returningUsers') / days),
-      newUserSharePct: totalUsers > 0 ? round1_((sum('newUsers') / totalUsers) * 100) : null,
-      totalHomeOpen: top,
-      totalTransactions: stages[2].eventCount,
-      totalPickupRequests: stages[3].eventCount,
-      transactionsShareOfHomePct: stages[2].shareOfTopPct,
-      pickupShareOfTransactionsPct: stages[3].stepConversionPct,
-      overallConversionPct: top > 0 ? round1_((last / top) * 100) : null,
-      largestLeak: largestLeakIndex > 0 ? {
-        index: largestLeakIndex,
-        from: stages[largestLeakIndex - 1].name,
-        to: stages[largestLeakIndex].name,
-        lost: stages[largestLeakIndex].lostFromPrev
-      } : null
+      avgDau: Math.round(totalDau / days),
+      avgFeatureUsers: round1_(totalFeatureUsers / days),
+      totalDauUserDays: totalDau,
+      totalFeatureUserDays: totalFeatureUsers,
+      penetrationPct: penetrationPct,
+      avgDailyPenetrationPct: withPen.length ? round2_(sum(withPen, 'penetrationPct') / withPen.length) : null,
+      bestDay: pick(withPen, (a, b) => a.penetrationPct > b.penetrationPct),
+      worstDay: pick(withPen, (a, b) => a.penetrationPct < b.penetrationPct),
+      peakFeatureUsersDay: pick(series, (a, b) => a.featureUsers > b.featureUsers),
+      latestDay: series[days - 1],
+      previousDay: days > 1 ? series[days - 2] : null,
+      trend: compareWindows_(series)
     },
-    funnel: stages,
-    dailySeries: series
+    funnel: {
+      steps: [
+        { name: 'Daily Active Users', avgPerDay: Math.round(totalDau / days), total: totalDau },
+        { name: 'Klik ' + selected.feature, avgPerDay: round1_(totalFeatureUsers / days), total: totalFeatureUsers }
+      ],
+      conversionPct: penetrationPct,
+      dropOffPct: penetrationPct == null ? null : round2_(100 - penetrationPct)
+    },
+    patterns: buildPatterns_(series),
+    dailySeries: series,
+    dataQualityIssues: issues
   };
 }
 
-function normalizeEvent_(s) {
-  return String(s || '').toLowerCase().trim().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+/** Recent window vs the window before it: 7 vs 7 days when there is enough data, otherwise half vs half. */
+function compareWindows_(series) {
+  if (series.length < 2) return null;
+  const size = series.length >= 14 ? 7 : Math.floor(series.length / 2);
+  const recent = series.slice(-size), prior = series.slice(-2 * size, -size);
+  const agg = rows => {
+    const dau = rows.reduce((a, r) => a + r.dau, 0), users = rows.reduce((a, r) => a + r.featureUsers, 0);
+    return { avgDau: dau / rows.length, avgUsers: users / rows.length, penetration: dau > 0 ? (users / dau) * 100 : null };
+  };
+  const a = agg(recent), b = agg(prior);
+  return {
+    label: 'last ' + size + ' vs previous ' + size + ' days',
+    windowDays: size,
+    recentPenetrationPct: a.penetration == null ? null : round2_(a.penetration),
+    priorPenetrationPct: b.penetration == null ? null : round2_(b.penetration),
+    penetrationChangePp: a.penetration == null || b.penetration == null ? null : round2_(a.penetration - b.penetration),
+    featureUsersChangePct: pctChange_(a.avgUsers, b.avgUsers),
+    dauChangePct: pctChange_(a.avgDau, b.avgDau)
+  };
+}
+
+/** Statistical patterns that are only reported once there is enough data to be meaningful. */
+function buildPatterns_(series) {
+  const pens = series.filter(r => r.penetrationPct != null);
+  const out = {};
+  if (pens.length >= 7) {
+    const mean = pens.reduce((a, r) => a + r.penetrationPct, 0) / pens.length;
+    const sd = Math.sqrt(pens.reduce((a, r) => a + Math.pow(r.penetrationPct - mean, 2), 0) / pens.length);
+    out.penetrationStdDevPp = round2_(sd);
+    out.anomalies = sd > 0 ? pens.filter(r => Math.abs(r.penetrationPct - mean) > 2 * sd).map(r => ({ date: r.date, penetrationPct: r.penetrationPct })) : [];
+  }
+  if (series.length >= 10) {
+    out.dauVsFeatureUsersCorrelation = round2_(correlation_(series.map(r => r.dau), series.map(r => r.featureUsers)));
+  }
+  if (series.length >= 14) {
+    const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const buckets = names.map(() => ({ dau: 0, users: 0 }));
+    series.forEach(r => {
+      const b = buckets[parseDate_(r.date).getDay()];
+      b.dau += r.dau;
+      b.users += r.featureUsers;
+    });
+    out.penetrationByWeekday = names
+      .map((n, i) => ({ day: n, penetrationPct: buckets[i].dau > 0 ? round2_((buckets[i].users / buckets[i].dau) * 100) : null }))
+      .filter(d => d.penetrationPct != null);
+  }
+  return out;
+}
+
+function correlation_(xs, ys) {
+  const n = xs.length;
+  const mx = xs.reduce((a, v) => a + v, 0) / n, my = ys.reduce((a, v) => a + v, 0) / n;
+  let num = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i] - mx) * (ys[i] - my);
+    dx += Math.pow(xs[i] - mx, 2);
+    dy += Math.pow(ys[i] - my, 2);
+  }
+  return dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0;
+}
+
+function pctChange_(current, previous) {
+  return previous > 0 ? round1_(((current - previous) / previous) * 100) : null;
 }
 
 function dateKey_(d) {
@@ -309,6 +401,10 @@ function round1_(n) {
   return Math.round(n * 10) / 10;
 }
 
+function round2_(n) {
+  return Math.round(n * 100) / 100;
+}
+
 /* ------------------------------ GEMINI API ------------------------------ */
 
 function callGemini_(data) {
@@ -316,17 +412,22 @@ function callGemini_(data) {
   if (!apiKey) throw new Error('Gemini API key missing in Script Properties.');
 
   const prompt = [
-    'You are a senior product analytics consultant analyzing the Lapak Sawit feature performance for SawitPRO.',
+    'You are a senior product analytics consultant analyzing the "' + data.feature + '" feature of the SawitPRO app (used by palm-oil farmers and agents).',
+    'Funnel: ' + data.funnelDefinition,
+    'Units: ' + data.unitsNote,
     'Output must be valid JSON matching this schema:',
     '{',
     '  "headline": "Clear single executive takeaway sentence",',
     '  "observations": ["Observation 1", "Observation 2", "Observation 3"],',
     '  "next_steps": [{"action": "Actionable item description", "pic": "Owner/Team"}],',
-    '  "speaker_notes": "A very detailed, professional presentation script for the speaker. Explain funnel drop-offs, user acquisition mix, operational risks in palm oil transactions, and step-by-step logic behind proposed recommendations in depth."',
+    '  "speaker_notes": "A detailed, professional presentation script. Explain the DAU-to-feature conversion, day-to-day variation, the trend comparison, any data quality warnings, and the reasoning behind each recommendation."',
     '}',
     '',
     'Rules (the slide has limited space, keep on-slide text short):',
     '- Ground every statement in DATA and quote numbers exactly as given.',
+    '- Never describe summed feature users as unique users for the period.',
+    '- If dataPeriod.days < 7, state that trends are preliminary.',
+    '- If dataQualityIssues is not empty, mention the most important one in an observation.',
     '- headline: one sentence, max 20 words.',
     '- observations: exactly 3 items, each max 24 words, no leading bullet characters.',
     '- next_steps: exactly 3 items; "action" max 16 words; "pic" is a short team name (max 4 words).',
@@ -363,7 +464,7 @@ function callGemini_(data) {
 function normalizeAi_(parsed) {
   const clean = s => String(s || '').replace(/^[\s•\-*]+/, '').trim();
   return {
-    headline: clampWords_(clean(parsed.headline) || 'Lapak Sawit Performance Executive Summary', 24),
+    headline: clampWords_(clean(parsed.headline) || 'Feature Performance Executive Summary', 24),
     observations: (parsed.observations || []).map(clean).filter(Boolean).slice(0, 3).map(o => clampWords_(o, 28)),
     nextSteps: (parsed.next_steps || []).slice(0, 3).map(s => ({
       action: clampWords_(clean(typeof s === 'string' ? s : s.action), 20),
@@ -393,29 +494,57 @@ function drawAnalysisSlide_(slide, data, ai) {
 function drawTitle_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
   addRichText_(slide, [
-    { text: 'Lapak Sawit', color: C.greenDark },
+    { text: data.feature, color: C.greenDark },
     { text: '   Feature Analysis Snapshot', color: C.muted, bold: false }
-  ], box.x, box.y, 420, box.h, { fontSize: 12, bold: true, valign: 'MIDDLE' });
+  ], box.x, box.y, 380, box.h, { fontSize: 12, bold: true, valign: 'MIDDLE' });
 
-  const pillText = 'PERIOD  ' + formatPeriod_(data.dataPeriod.start, data.dataPeriod.end);
+  const pillText = 'PERIOD  ' + formatPeriod_(data.dataPeriod.start, data.dataPeriod.end) + '  ·  ' + data.dataPeriod.days + ' days';
   const pillW = estimateTextWidth_(pillText, 6.5, true) + 18;
-  pill_(slide, pillText, box.x + box.w - pillW, box.y + 2, pillW, 14, C.greenSoft, C.greenDark, 6.5);
+  const pillX = box.x + box.w - pillW;
+  pill_(slide, pillText, pillX, box.y + 2, pillW, 14, C.greenSoft, C.greenDark, 6.5);
+
+  const issues = data.dataQualityIssues.length;
+  if (issues) {
+    const warn = '⚠ ' + issues + ' data warning' + (issues > 1 ? 's' : '') + ' — see Run Log';
+    const warnW = estimateTextWidth_(warn, 6, true) + 4;
+    addText_(slide, warn, pillX - warnW - 8, box.y + 2, warnW, 14, { fontSize: 6, bold: true, color: C.red, align: 'END', valign: 'MIDDLE' });
+  }
 }
 
 function drawKpiCards_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
   const s = data.summary;
-  const pickupAlert = s.totalPickupRequests === 0 && s.totalTransactions > 0;
+  const latest = s.latestDay, prev = s.previousDay;
+
+  let latestSub = fmtPct_(latest.penetrationPct, 2) + ' penetration';
+  let latestColor = C.muted, latestAccent = C.greenDark;
+  if (prev) {
+    const diff = latest.featureUsers - prev.featureUsers;
+    latestSub = (diff > 0 ? '▲ +' : diff < 0 ? '▼ −' : '■ ') + fmtNum_(Math.abs(diff)) + ' vs ' + formatShortDate_(prev.date) + ' · ' + fmtPct_(latest.penetrationPct, 2);
+    latestColor = diff > 0 ? C.okInk : diff < 0 ? C.red : C.muted;
+    latestAccent = diff > 0 ? C.greenLine : diff < 0 ? C.red : C.muted;
+  }
+
   const cards = [
-    { label: 'AVG DAILY ACTIVE', value: fmtNum_(s.avgDau), sub: 'users/day · ' + data.dailySeries.length + ' days', accent: C.blue },
-    { label: 'HOME OPEN', value: fmtNum_(s.totalHomeOpen), sub: 'total events (funnel entry)', accent: C.greenDark },
-    { label: 'JUAL TBS', value: fmtNum_(s.totalTransactions), sub: fmtPct_(s.transactionsShareOfHomePct) + ' of Home Open', accent: C.orange },
+    { label: 'AVG DAILY ACTIVE (APP)', value: fmtNum_(s.avgDau), sub: 'users/day · ' + data.dataPeriod.days + ' days', accent: C.blue },
     {
-      label: 'PICKUP REQUESTS',
-      value: fmtNum_(s.totalPickupRequests),
-      sub: pickupAlert ? '⚠ 0 of ' + fmtNum_(s.totalTransactions) + ' Jual TBS — check' : fmtPct_(s.pickupShareOfTransactionsPct) + ' of Jual TBS',
-      accent: pickupAlert ? C.red : C.greenLine,
-      alert: pickupAlert
+      label: 'AVG FEATURE USERS',
+      value: fmtNum_(s.avgFeatureUsers, 1),
+      sub: s.peakFeatureUsersDay ? 'per day · peak ' + fmtNum_(s.peakFeatureUsersDay.featureUsers) + ' on ' + formatShortDate_(s.peakFeatureUsersDay.date) : 'per day',
+      accent: C.greenBar
+    },
+    {
+      label: 'PENETRATION',
+      value: fmtPct_(s.penetrationPct, 2),
+      sub: s.worstDay ? 'range ' + fmtPct_(s.worstDay.penetrationPct, 2) + ' – ' + fmtPct_(s.bestDay.penetrationPct, 2) : 'feature users / DAU',
+      accent: C.greenDark
+    },
+    {
+      label: 'LATEST · ' + formatShortDate_(latest.date).toUpperCase(),
+      value: fmtNum_(latest.featureUsers) + ' users',
+      sub: latestSub,
+      subColor: latestColor,
+      accent: latestAccent
     }
   ];
   const gap = 8;
@@ -425,189 +554,190 @@ function drawKpiCards_(slide, data, box) {
 
 function drawKpiCard_(slide, x, y, w, h, card) {
   const C = LS_CONFIG.COLORS;
-  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, x, y, w, h, card.alert ? C.redSoft : C.cardBg, card.alert ? C.redBorder : C.border);
+  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, x, y, w, h, C.cardBg, C.border);
   rect_(slide, SlidesApp.ShapeType.RECTANGLE, x, y + 7, 3, h - 14, card.accent);
 
   addText_(slide, card.label, x + 10, y + 5, w - 14, 8, { fontSize: 6, bold: true, color: C.muted });
-  addText_(slide, card.value, x + 10, y + 14, w - 14, 16, { fontSize: 15, bold: true, color: card.alert ? C.red : C.ink, valign: 'MIDDLE' });
-  addText_(slide, card.sub, x + 10, y + 31, w - 14, 7, { fontSize: 5.5, color: card.alert ? C.red : C.muted, bold: !!card.alert });
+  addText_(slide, card.value, x + 10, y + 14, w - 14, 16, { fontSize: 15, bold: true, color: C.ink, valign: 'MIDDLE' });
+  addText_(slide, card.sub, x + 10, y + 31, w - 14, 7, { fontSize: 5.5, color: card.subColor || C.muted, bold: !!card.subColor && card.subColor !== C.muted });
 }
 
 /**
- * Funnel as ranked rows: step badge, stage name, volume bar on a full-width track,
- * and a colour-coded step-conversion pill. Zero-volume stages and the largest leak are flagged red.
+ * Two-step funnel: app DAU → users who clicked the feature (average per day).
+ * Left: step rows on a shared track so the drop is visible to scale. Right: conversion callout + trend.
  */
 function drawFunnel_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
-  const stages = data.funnel;
-  const leak = data.summary.largestLeak;
+  const f = data.funnel, s = data.summary;
+  const steps = f.steps;
 
   panel_(slide, box);
-  sectionTitle_(slide, 'FUNNEL CONVERSION', box.x + 10, box.y + 8, 140);
+  sectionTitle_(slide, 'FEATURE FUNNEL', box.x + 10, box.y + 8, 120);
+  addText_(slide, 'Average per day · ' + data.dataPeriod.days + ' days', box.x + 140, box.y + 8, 150, 11, { fontSize: 6, color: C.muted, valign: 'MIDDLE' });
 
-  const headerParts = [
-    { text: 'Overall  ', color: C.muted },
-    { text: fmtPct_(data.summary.overallConversionPct), color: C.ink, bold: true }
-  ];
-  if (leak) {
-    headerParts.push(
-      { text: '     Largest leak  ', color: C.muted },
-      { text: leak.from + ' → ' + leak.to + ' (−' + fmtNum_(leak.lost) + ')', color: C.red, bold: true }
-    );
-  }
-  addRichText_(slide, headerParts, box.x + box.w - 290, box.y + 8, 280, 11, { fontSize: 6, align: 'END', valign: 'MIDDLE' });
-
-  const col = {
-    badge: box.x + 10,
-    label: box.x + 28,
-    track: box.x + 122,
-    conv: box.x + box.w - 98
-  };
+  const callout = { x: box.x + box.w - 120, y: box.y + 26, w: 110, h: box.h - 34 };
+  const col = { badge: box.x + 10, label: box.x + 28, track: box.x + 112 };
   col.labelW = col.track - col.label - 6;
-  col.trackW = col.conv - col.track - 10;
-  col.convW = box.x + box.w - 10 - col.conv;
+  col.trackW = callout.x - 12 - col.track;
 
-  const headY = box.y + 24;
-  [['STAGE', col.label, col.labelW, 'START'], ['EVENT VOLUME', col.track, col.trackW, 'START'], ['STEP CONVERSION', col.conv, col.convW, 'CENTER']]
-    .forEach(h => addText_(slide, h[0], h[1], headY, h[2], 7, { fontSize: 5.5, bold: true, color: C.muted, align: h[3] }));
-  hLine_(slide, box.x + 10, box.x + box.w - 10, headY + 9, C.border, 0.5);
+  const rowH = 22;
+  const rowY = [box.y + 30, box.y + 66];
+  const colors = [C.greenDark, C.greenBar];
 
-  const rowY0 = box.y + 37, rowH = 18, rowGap = 4;
-  const centerY = i => rowY0 + i * (rowH + rowGap) + rowH / 2;
-  const maxVal = Math.max(1, ...stages.map(s => s.eventCount));
-
-  // Vertical connector behind the step badges
-  const connector = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, col.badge + 6, centerY(0), col.badge + 6, centerY(stages.length - 1));
+  const connector = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, col.badge + 6, rowY[0] + rowH / 2, col.badge + 6, rowY[1] + rowH / 2);
   connector.getLineFill().setSolidFill(C.border);
   connector.setWeight(1);
 
-  stages.forEach((stage, i) => {
-    const y = centerY(i) - rowH / 2;
-    const cy = centerY(i);
-    const isZero = stage.eventCount === 0;
-    const color = isZero ? C.red : LS_CONFIG.FUNNEL_COLORS[i % LS_CONFIG.FUNNEL_COLORS.length];
-
-    // Step badge
-    rect_(slide, SlidesApp.ShapeType.ELLIPSE, col.badge, cy - 6, 12, 12, color, C.white, 1);
+  steps.forEach((step, i) => {
+    const y = rowY[i], cy = y + rowH / 2;
+    rect_(slide, SlidesApp.ShapeType.ELLIPSE, col.badge, cy - 6, 12, 12, colors[i], C.white, 1);
     addText_(slide, String(i + 1), col.badge, cy - 6, 12, 12, { fontSize: 6, bold: true, color: C.white, align: 'CENTER', valign: 'MIDDLE' });
 
-    // Stage name (shrinks to stay on one line where possible)
-    const labelSize = fitFontSize_([stage.name], col.labelW, 9, 7, 6, 0, true);
-    addText_(slide, stage.name, col.label, y, col.labelW, rowH, { fontSize: labelSize, bold: true, color: isZero ? C.red : C.ink, valign: 'MIDDLE' });
+    const labelSize = fitFontSize_([step.name], col.labelW, 9, 7, 6, 0, true);
+    addText_(slide, step.name, col.label, y, col.labelW, rowH, { fontSize: labelSize, bold: true, color: C.ink, valign: 'MIDDLE' });
 
-    // Volume bar on a full-width track
-    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, col.trackW, 12, C.track);
-    const fillW = isZero ? 0 : Math.max(6, col.trackW * stage.eventCount / maxVal);
-    if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, fillW, 12, color);
+    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 7, col.trackW, 14, C.track);
+    const ratio = i === 0 ? 1 : (f.conversionPct || 0) / 100;
+    const fillW = step.avgPerDay > 0 ? Math.max(5, col.trackW * ratio) : 0;
+    if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 7, fillW, 14, colors[i]);
 
-    const valueInside = fillW >= 34;
-    if (valueInside) {
-      addText_(slide, fmtNum_(stage.eventCount), col.track, y, fillW - 6, rowH, { fontSize: 7, bold: true, color: C.white, align: 'END', valign: 'MIDDLE' });
-    }
-    const outside = [];
-    if (isZero) {
-      outside.push({ text: '0', bold: true, color: C.red }, { text: '  ·  no events recorded', color: C.red });
+    if (fillW >= 34) {
+      addText_(slide, fmtNum_(step.avgPerDay, 1), col.track, y, fillW - 6, rowH, { fontSize: 7.5, bold: true, color: C.white, align: 'END', valign: 'MIDDLE' });
     } else {
-      if (!valueInside) outside.push({ text: fmtNum_(stage.eventCount), bold: true, color: C.ink });
-      if (i > 0) outside.push({ text: (outside.length ? '  ·  ' : '') + fmtPct_(stage.shareOfTopPct) + ' of Home Open', color: C.muted });
-    }
-    if (outside.length) {
       const ox = col.track + fillW + 5;
-      addRichText_(slide, outside, ox, y, col.track + col.trackW - ox, rowH, { fontSize: 6.5, valign: 'MIDDLE' });
+      addRichText_(slide, [
+        { text: fmtNum_(step.avgPerDay, 1), bold: true, color: C.ink },
+        { text: '  ·  ' + fmtPct_(f.conversionPct, 2) + ' of DAU', color: C.muted }
+      ], ox, y, col.track + col.trackW - ox, rowH, { fontSize: 7, valign: 'MIDDLE' });
     }
-
-    // Step conversion pill
-    const pill = conversionPill_(stage, i, leak);
-    pill_(slide, pill.text, col.conv, cy - 6, col.convW, 12, pill.fill, pill.ink, 6);
   });
+
+  // Drop-off between the two steps
+  if (f.dropOffPct != null) {
+    addRichText_(slide, [
+      { text: '▼ ' + fmtPct_(f.dropOffPct, 2), bold: true, color: C.red },
+      { text: ' of DAU did not open ' + data.feature, color: C.muted }
+    ], col.track, rowY[0] + rowH + 2, col.trackW, 10, { fontSize: 6, valign: 'MIDDLE' });
+  }
+
+  // Best / lowest day
+  if (s.bestDay && s.worstDay) {
+    const statsY = box.y + box.h - 22;
+    hLine_(slide, box.x + 10, callout.x - 12, statsY - 3, C.border, 0.5);
+    addRichText_(slide, [
+      { text: 'Best day  ', color: C.muted },
+      { text: formatShortDate_(s.bestDay.date) + ' · ' + fmtPct_(s.bestDay.penetrationPct, 2), bold: true, color: C.okInk },
+      { text: '  (' + fmtNum_(s.bestDay.featureUsers) + ' of ' + fmtNum_(s.bestDay.dau) + ')', color: C.muted },
+      { text: '      Lowest  ', color: C.muted },
+      { text: formatShortDate_(s.worstDay.date) + ' · ' + fmtPct_(s.worstDay.penetrationPct, 2), bold: true, color: C.red },
+      { text: '  (' + fmtNum_(s.worstDay.featureUsers) + ' of ' + fmtNum_(s.worstDay.dau) + ')', color: C.muted }
+    ], box.x + 10, statsY, callout.x - 22 - box.x, 12, { fontSize: 6, valign: 'MIDDLE' });
+  }
+
+  // Conversion callout
+  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, callout.x, callout.y, callout.w, callout.h, C.greenSoft);
+  addText_(slide, 'CLICK-THROUGH RATE', callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  addText_(slide, fmtPct_(f.conversionPct, 2), callout.x + 6, callout.y + 17, callout.w - 12, 22, { fontSize: 19, bold: true, color: C.greenDark, align: 'CENTER', valign: 'MIDDLE' });
+  addText_(slide, 'of DAU open ' + data.feature, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+
+  const t = s.trend;
+  if (t && t.penetrationChangePp != null) {
+    const pp = t.penetrationChangePp;
+    const up = pp > 0, flat = pp === 0;
+    const text = (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp';
+    pill_(slide, text, callout.x + 14, callout.y + 56, callout.w - 28, 12,
+      flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 6.5);
+    addText_(slide, t.label, callout.x + 6, callout.y + 71, callout.w - 12, 8, { fontSize: 5, color: C.muted, align: 'CENTER' });
+  }
 }
 
-function conversionPill_(stage, i, leak) {
-  const C = LS_CONFIG.COLORS;
-  if (i === 0) return { text: 'Entry point', fill: C.cardBg, ink: C.muted };
-  const pct = stage.stepConversionPct;
-  if (pct == null) return { text: 'n/a (no prior)', fill: C.cardBg, ink: C.muted };
-  const text = fmtPct_(pct) + ' conv  ▼' + fmtPct_(100 - pct, 0);
-  if (pct === 0 || (leak && leak.index === i)) return { text: text, fill: C.redSoft, ink: C.red };
-  if (pct < 30) return { text: text, fill: C.amberSoft, ink: C.amber };
-  return { text: text, fill: C.okSoft, ink: C.okInk };
-}
-
+/** Feature users as bars (right axis) with app DAU as a line (left axis); penetration under each date when space allows. */
 function drawDailyChart_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
   const rows = data.dailySeries;
-  const s = data.summary;
+  const n = rows.length;
+  const detailed = n <= 14;
 
   panel_(slide, box);
-  sectionTitle_(slide, 'DAILY ACTIVE USERS & USER MIX', box.x + 10, box.y + 8, 170);
-  if (s.newUserSharePct != null) {
-    addText_(slide, s.newUserSharePct + '% new users', box.x + 183, box.y + 8, 80, 11, { fontSize: 6, color: C.muted, valign: 'MIDDLE' });
-  }
-
-  const series = [
-    { key: 'dau', label: 'DAU', color: C.blue },
-    { key: 'newUsers', label: 'New', color: C.orange },
-    { key: 'returningUsers', label: 'Returning', color: C.greenLine }
-  ];
+  sectionTitle_(slide, 'DAILY TREND', box.x + 10, box.y + 8, 80);
 
   // Legend, right-aligned on the title row
+  const legend = [
+    { label: 'App DAU (left)', color: C.blue, kind: 'line' },
+    { label: 'Feature users (right)', color: C.greenBar, kind: 'bar' }
+  ];
+  if (detailed) legend.push({ label: '% = penetration', color: C.greenDark, kind: 'text' });
   let lx = box.x + box.w - 10;
-  series.slice().reverse().forEach(item => {
+  legend.slice().reverse().forEach(item => {
     const tw = estimateTextWidth_(item.label, 6);
     lx -= tw;
-    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: C.ink, valign: 'MIDDLE' });
-    lx -= 13;
-    const key = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, lx, box.y + 13.5, lx + 10, box.y + 13.5);
-    key.getLineFill().setSolidFill(item.color);
-    key.setWeight(2);
-    lx -= 10;
+    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: item.kind === 'text' ? C.greenDark : C.ink, valign: 'MIDDLE' });
+    if (item.kind === 'line') {
+      lx -= 13;
+      hLine_(slide, lx, lx + 10, box.y + 13.5, item.color, 2);
+    } else if (item.kind === 'bar') {
+      lx -= 10;
+      rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, box.y + 10, 7, 7, item.color);
+    }
+    lx -= 12;
   });
 
-  if (!rows.length) return;
+  const plot = { x: box.x + 34, y: box.y + 30, w: box.w - 34 - 34, h: box.h - 30 - (detailed ? 24 : 16) };
+  const maxDau = niceMax_(Math.max(1, ...rows.map(r => r.dau)));
+  // Bars use a taller scale so they stay in the lower part of the plot, clear of the DAU line
+  const maxUsers = niceMax_(Math.max(1, ...rows.map(r => r.featureUsers)) * 1.6);
+  const band = plot.w / n;
+  const px = i => plot.x + (i + 0.5) * band;
+  const yOf = (v, max) => plot.y + plot.h - (v / max) * plot.h;
 
-  const plot = { x: box.x + 34, y: box.y + 30, w: box.w - 34 - 32, h: box.h - 30 - 20 };
-  const maxVal = niceMax_(Math.max(1, ...rows.flatMap(r => [r.dau, r.returningUsers, r.newUsers])));
-  const px = i => rows.length === 1 ? plot.x + plot.w / 2 : plot.x + (i * plot.w) / (rows.length - 1);
-  const py = v => plot.y + plot.h - (v / maxVal) * plot.h;
-
-  // Gridlines + y-axis labels
-  [0, 0.5, 1].forEach(f => {
-    const gy = plot.y + plot.h - f * plot.h;
-    const line = hLine_(slide, plot.x, plot.x + plot.w, gy, f === 0 ? C.border : C.grid, f === 0 ? 0.75 : 0.5);
-    if (f > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
-    addText_(slide, fmtNum_(maxVal * f), box.x + 6, gy - 4, plot.x - box.x - 12, 8, { fontSize: 5.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
+  // Gridlines + dual axis labels
+  [0, 0.5, 1].forEach(fr => {
+    const gy = plot.y + plot.h - fr * plot.h;
+    const line = hLine_(slide, plot.x, plot.x + plot.w, gy, fr === 0 ? C.border : C.grid, fr === 0 ? 0.75 : 0.5);
+    if (fr > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
+    addText_(slide, fmtNum_(maxDau * fr, maxDau < 10 ? 1 : 0), box.x + 6, gy - 4, plot.x - box.x - 10, 8, { fontSize: 5.5, color: C.blue, align: 'END', valign: 'MIDDLE' });
+    addText_(slide, fmtNum_(maxUsers * fr, maxUsers < 10 ? 1 : 0), plot.x + plot.w + 4, gy - 4, 24, 8, { fontSize: 5.5, color: C.greenBar, valign: 'MIDDLE' });
   });
 
-  // X-axis date labels (thinned out for long ranges)
-  const every = Math.ceil(rows.length / 8);
+  // Feature-user bars
+  const barW = Math.max(2, Math.min(16, band * 0.55));
   rows.forEach((r, i) => {
-    if (i % every !== 0 && i !== rows.length - 1) return;
-    addText_(slide, formatShortDate_(r.date), px(i) - 20, plot.y + plot.h + 4, 40, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
-  });
-
-  // Series lines + point markers
-  const showMarkers = rows.length <= 14;
-  series.forEach(item => {
-    for (let i = 1; i < rows.length; i++) {
-      const line = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, px(i - 1), py(rows[i - 1][item.key]), px(i), py(rows[i][item.key]));
-      line.getLineFill().setSolidFill(item.color);
-      line.setWeight(1.75);
-    }
-    if (showMarkers) {
-      rows.forEach((r, i) => rect_(slide, SlidesApp.ShapeType.ELLIPSE, px(i) - 2.25, py(r[item.key]) - 2.25, 4.5, 4.5, item.color, C.white, 0.75));
+    const top = yOf(r.featureUsers, maxUsers);
+    const h = plot.y + plot.h - top;
+    if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, px(i) - barW / 2, top, barW, h, C.greenBar);
+    if (detailed) {
+      addText_(slide, fmtNum_(r.featureUsers), px(i) - 15, top - 9, 30, 8, { fontSize: 5.5, bold: true, color: C.greenDark, align: 'CENTER', valign: 'MIDDLE' });
     }
   });
 
-  // End-of-line value labels, nudged apart so they never overlap
-  const lastIdx = rows.length - 1;
-  const labels = series
-    .map(item => ({ item: item, value: rows[lastIdx][item.key], y: py(rows[lastIdx][item.key]) }))
-    .sort((a, b) => a.y - b.y);
-  for (let i = 1; i < labels.length; i++) {
-    if (labels[i].y - labels[i - 1].y < 8) labels[i].y = labels[i - 1].y + 8;
+  // DAU line + markers
+  for (let i = 1; i < n; i++) {
+    const line = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, px(i - 1), yOf(rows[i - 1].dau, maxDau), px(i), yOf(rows[i].dau, maxDau));
+    line.getLineFill().setSolidFill(C.blue);
+    line.setWeight(1.75);
   }
-  labels.forEach(l => {
-    addText_(slide, fmtNum_(l.value), px(lastIdx) + 5, l.y - 4, 24, 8, { fontSize: 6, bold: true, color: l.item.color, valign: 'MIDDLE' });
+  if (detailed) {
+    rows.forEach((r, i) => {
+      const y = yOf(r.dau, maxDau);
+      rect_(slide, SlidesApp.ShapeType.ELLIPSE, px(i) - 2.25, y - 2.25, 4.5, 4.5, C.blue, C.white, 0.75);
+      addText_(slide, fmtNum_(r.dau), px(i) - 15, y - 11, 30, 8, { fontSize: 5.5, bold: true, color: C.blue, align: 'CENTER', valign: 'MIDDLE' });
+    });
+  }
+
+  // X-axis: date (+ penetration when detailed), thinned out for long ranges
+  const every = Math.ceil(n / 8);
+  const labelIdx = [];
+  for (let i = 0; i < n; i += every) labelIdx.push(i);
+  if (labelIdx[labelIdx.length - 1] !== n - 1) {
+    // Always label the latest date; drop the previous label if the two would collide
+    if (n - 1 - labelIdx[labelIdx.length - 1] < every * 0.6) labelIdx.pop();
+    labelIdx.push(n - 1);
+  }
+  labelIdx.forEach(i => {
+    const r = rows[i];
+    const parts = [{ text: formatShortDate_(r.date), color: C.muted }];
+    if (detailed) parts.push({ text: '\n' + fmtPct_(r.penetrationPct, 2), color: C.greenDark, bold: true });
+    addRichText_(slide, parts, px(i) - 22, plot.y + plot.h + 3, 44, detailed ? 16 : 8, { fontSize: 5.5, align: 'CENTER' });
   });
 }
 
@@ -803,10 +933,12 @@ function niceMax_(value) {
   return 10 * magnitude;
 }
 
-function fmtNum_(n) {
+/** Thousands separators; up to `digits` decimals with trailing zeros dropped. */
+function fmtNum_(n, digits) {
   if (n == null || !isFinite(n)) return '–';
-  const rounded = Math.abs(n) < 10 && n % 1 !== 0 ? n.toFixed(1) : String(Math.round(n));
-  return rounded.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const parts = String(Number(Number(n).toFixed(digits || 0))).split('.');
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return parts.join('.');
 }
 
 function fmtPct_(value, digits) {
