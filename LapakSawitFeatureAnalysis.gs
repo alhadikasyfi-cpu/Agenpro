@@ -15,6 +15,9 @@ const LS_CONFIG = {
   FEATURE_NAME: 'Lapak Sawit', // also the name of the source sheet
   SHEET_LOG: 'Run Log',
   OUTPUT_LANGUAGE: 'English',
+  // Slides generated per run, in order: 'summary' = all apps side by side, 'apps' = one detail slide per app.
+  // Use ['apps'] for per-app slides only.
+  SLIDES: ['summary', 'apps'],
   FONT: 'Arial',
 
   // Accepted header names per field, after normalising (lower-case, non-alphanumerics → "_").
@@ -75,6 +78,7 @@ const LS_CONFIG = {
     greenDark: '#31512B',
     greenMid: '#49663D',
     greenBar: '#6E9A5E',
+    returning: '#E0A800',
     greenSoft: '#EEF4EA',
     greenMuted: '#C9DCC1',
     yellow: '#FFD400',
@@ -173,30 +177,42 @@ function generateLapakSawitSlide() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = readFeatureSheet_(ss);
     const analysisInput = buildAnalysisInput_(sheet);
-    const ai = callGemini_(analysisInput);
+
+    // One spec per slide: the summary and/or one detail slide per app
+    const specs = [];
+    LS_CONFIG.SLIDES.forEach(kind => {
+      if (kind === 'summary') specs.push({ app: null });
+      if (kind === 'apps') analysisInput.apps.forEach(app => specs.push({ app: app }));
+    });
+    if (!specs.length) throw new Error('LS_CONFIG.SLIDES is empty.');
+
+    // All Gemini calls run in parallel
+    const aiResults = callGeminiAll_(analysisInput, specs.map(s => s.app));
 
     const presentation = getOrCreatePresentation_();
     const slides = presentation.getSlides();
     if (!slides.length) throw new Error('Presentation missing master template on Slide 1.');
 
-    // 1. Duplicate Master Template Slide
-    const newSlide = slides[0].duplicate();
+    specs.forEach((spec, i) => {
+      // Duplicate the master template and keep this run's slides in order right after it
+      const newSlide = slides[0].duplicate();
+      newSlide.move(1 + i);
 
-    // 2. Render Slide UI Layout
-    drawAnalysisSlide_(newSlide, analysisInput, ai);
+      if (spec.app) drawAppSlide_(newSlide, analysisInput, spec.app, aiResults[i]);
+      else drawSummarySlide_(newSlide, analysisInput, aiResults[i]);
 
-    // 3. Inject Detailed Speaker Notes
-    if (ai.speakerNotes) {
-      newSlide.getNotesPage().getSpeakerNotesShape().getText().setText(ai.speakerNotes);
-    }
+      if (aiResults[i].speakerNotes) {
+        newSlide.getNotesPage().getSpeakerNotesShape().getText().setText(aiResults[i].speakerNotes);
+      }
+    });
 
     presentationUrl = 'https://docs.google.com/presentation/d/' + presentation.getId() + '/edit';
     const issues = analysisInput.dataQualityIssues;
-    const message = 'Slide generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' +
+    const message = specs.length + ' slide(s) generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' +
       (issues.length ? ' Data warnings: ' + issues.join('; ') : '');
     logRun_(ss, issues.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);
 
-    SpreadsheetApp.getUi().alert('Slide generated successfully!' +
+    SpreadsheetApp.getUi().alert(specs.length + ' slide(s) generated successfully!' +
       (issues.length ? '\n\n' + issues.length + ' data warning(s), see Run Log.' : '') +
       '\n\nOpen presentation:\n' + presentationUrl);
   } catch (err) {
@@ -444,6 +460,7 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
       repeatUsers: repeatUsers,
       repeatRatePct: uniqueUsers ? round1_((repeatUsers / uniqueUsers) * 100) : null,
       maxActiveDaysBySingleUser: maxActiveDays,
+      peakFeatureUsersDay: series.reduce((best, r) => (best == null || r.featureUsers > best.featureUsers ? r : best), null),
       bestDay: pick((a, b) => a.ctrPct > b.ctrPct),
       worstDay: pick((a, b) => a.ctrPct < b.ctrPct),
       latestDay: series[days - 1],
@@ -535,12 +552,58 @@ function round2_(n) {
 
 /* ------------------------------ GEMINI API ------------------------------ */
 
-function callGemini_(data) {
+/** One Gemini request per slide (focusApp = null for the summary slide), sent in parallel. */
+function callGeminiAll_(data, focusApps) {
   const apiKey = PropertiesService.getScriptProperties().getProperty(LS_CONFIG.API_KEY_PROPERTY);
   if (!apiKey) throw new Error('Gemini API key missing in Script Properties.');
 
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(LS_CONFIG.GEMINI_MODEL) + ':generateContent';
+  const requests = focusApps.map(app => ({
+    url: url,
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': apiKey },
+    payload: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: buildGeminiPrompt_(data, app) }] }],
+      generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+    }),
+    muteHttpExceptions: true
+  }));
+
+  return UrlFetchApp.fetchAll(requests).map((response, i) => {
+    if (response.getResponseCode() !== 200) {
+      throw new Error('Gemini API error (' + (focusApps[i] ? focusApps[i].app : 'summary') + '): ' + response.getContentText());
+    }
+    const envelope = JSON.parse(response.getContentText());
+    return normalizeAi_(JSON.parse(envelope.candidates[0].content.parts[0].text));
+  });
+}
+
+function buildGeminiPrompt_(data, focusApp) {
   const appLines = LS_CONFIG.APPS.map(a => '- ' + a.label + ': ' + a.description);
-  const prompt = [
+  const payload = focusApp ? {
+    feature: data.feature,
+    funnelDefinition: data.funnelDefinition,
+    unitsNote: data.unitsNote,
+    dataPeriod: data.dataPeriod,
+    focusApp: focusApp,
+    benchmarkOtherApps: data.apps.filter(a => a !== focusApp).map(a => ({
+      app: a.app, ctrPct: a.summary.ctrPct, avgFeatureUsers: a.summary.avgFeatureUsers, uniqueUsers: a.summary.uniqueUsers
+    })),
+    dataQualityIssues: data.dataQualityIssues.filter(i => i.indexOf(focusApp.app + ' ') === 0)
+  } : data;
+
+  const scope = focusApp ? [
+    'SLIDE SCOPE: this slide covers ONLY ' + focusApp.app + ' (' + (focusApp.appDescription || 'app variant') + ').',
+    'Analyze its funnel DAU → click ' + data.feature + ' → returning users. Use benchmarkOtherApps only as a brief comparison.',
+    'Recommendations must suit the ' + focusApp.app + ' users and what they do in that app.'
+  ] : [
+    'SLIDE SCOPE: executive summary comparing all apps side by side (' + data.apps.map(a => a.app).join(' vs ') + ').',
+    'Explain which app converts DAU to ' + data.feature + ' better and why that may be, given each app\'s users.'
+  ];
+
+  return [
     'You are a senior product analytics consultant at SawitPRO (palm-oil / FFB supply chain platform in Indonesia).',
     'You are analyzing the "' + data.feature + '" feature.',
     '',
@@ -551,6 +614,8 @@ function callGemini_(data) {
     LS_CONFIG.FEATURE_CONTEXT.map(l => '- ' + l).join('\n'),
     'Users of AgenPRO are agents; users of TimPRO are pengurus. Interpret differences between the apps in light of these roles.',
     '',
+    scope.join('\n'),
+    '',
     'METRICS',
     'Funnel: ' + data.funnelDefinition,
     'Units: ' + data.unitsNote,
@@ -560,7 +625,7 @@ function callGemini_(data) {
     '  "headline": "Clear single executive takeaway sentence",',
     '  "observations": ["Observation 1", "Observation 2", "Observation 3"],',
     '  "next_steps": [{"action": "Actionable item description", "pic": "Owner/Team"}],',
-    '  "speaker_notes": "A detailed, professional presentation script. Explain the DAU-to-feature funnel per app, the AgenPRO vs TimPRO comparison, new vs returning and repeat users, the trend, any data quality warnings, and the reasoning behind each recommendation."',
+    '  "speaker_notes": "A detailed, professional presentation script for this slide: walk through the funnel, new vs returning and repeat users, the trend, any data quality warnings, and the reasoning behind each recommendation."',
     '}',
     '',
     'Rules (the slide has limited space, keep on-slide text short):',
@@ -576,30 +641,8 @@ function callGemini_(data) {
     '- speaker_notes: no length limit.',
     '',
     'DATA:',
-    JSON.stringify(data)
+    JSON.stringify(payload)
   ].join('\n');
-
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(LS_CONFIG.GEMINI_MODEL) + ':generateContent';
-
-  const response = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { 'x-goog-api-key': apiKey },
-    payload: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
-    }),
-    muteHttpExceptions: true
-  });
-
-  if (response.getResponseCode() !== 200) {
-    throw new Error('Gemini API error: ' + response.getContentText());
-  }
-
-  const envelope = JSON.parse(response.getContentText());
-  const parsed = JSON.parse(envelope.candidates[0].content.parts[0].text);
-  return normalizeAi_(parsed);
 }
 
 // Trims AI output to what fits on the slide; the full narrative lives in speaker notes.
@@ -623,7 +666,8 @@ function clampWords_(text, maxWords) {
 
 /* ------------------------------ SLIDE DESIGN & UI ---------------------------- */
 
-function drawAnalysisSlide_(slide, data, ai) {
+/** Summary slide: all apps side by side. */
+function drawSummarySlide_(slide, data, ai) {
   const L = LS_CONFIG.LAYOUT;
   drawTitle_(slide, data, L.title);
   drawKpiCards_(slide, data, L.kpi);
@@ -633,19 +677,30 @@ function drawAnalysisSlide_(slide, data, ai) {
   drawNextSteps_(slide, ai, L.actions);
 }
 
-function drawTitle_(slide, data, box) {
+/** Detail slide for a single app. */
+function drawAppSlide_(slide, data, app, ai) {
+  const L = LS_CONFIG.LAYOUT;
+  drawTitle_(slide, data, L.title, app);
+  drawAppKpiCards_(slide, data, app, L.kpi);
+  drawAppFunnel_(slide, data, app, L.funnel);
+  drawAppDailyChart_(slide, app, L.chart);
+  drawObservations_(slide, ai, L.observations);
+  drawNextSteps_(slide, ai, L.actions);
+}
+
+function drawTitle_(slide, data, box, app) {
   const C = LS_CONFIG.COLORS;
-  addRichText_(slide, [
-    { text: data.feature, color: C.greenDark },
-    { text: '   Feature Analysis Snapshot', color: C.muted, bold: false }
-  ], box.x, box.y, 380, box.h, { fontSize: 12, bold: true, valign: 'MIDDLE' });
+  const parts = [{ text: data.feature, color: C.greenDark }];
+  if (app) parts.push({ text: '  ·  ', color: C.muted }, { text: app.app, color: app.color });
+  parts.push({ text: app ? '   Feature Deep Dive' : '   Feature Analysis Snapshot · All Apps', color: C.muted, bold: false });
+  addRichText_(slide, parts, box.x, box.y, 400, box.h, { fontSize: 12, bold: true, valign: 'MIDDLE' });
 
   const pillText = 'PERIOD  ' + formatPeriod_(data.dataPeriod.start, data.dataPeriod.end) + '  ·  ' + data.dataPeriod.days + ' days';
   const pillW = estimateTextWidth_(pillText, 6.5, true) + 18;
   const pillX = box.x + box.w - pillW;
   pill_(slide, pillText, pillX, box.y + 2, pillW, 14, C.greenSoft, C.greenDark, 6.5);
 
-  const issues = data.dataQualityIssues.length;
+  const issues = data.dataQualityIssues.filter(i => !app || i.indexOf(app.app + ' ') === 0).length;
   if (issues) {
     const warn = '⚠ ' + issues + ' data warning' + (issues > 1 ? 's' : '') + ' — see Run Log';
     const warnW = estimateTextWidth_(warn, 6, true) + 4;
@@ -845,6 +900,228 @@ function drawDailyChart_(slide, data, box) {
   }
   labelIdx.forEach(i => {
     addText_(slide, formatShortDate_(dates[i]), px(i) - 20, plot.y + plot.h + 3, 40, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+  });
+}
+
+function drawAppKpiCards_(slide, data, app, box) {
+  const C = LS_CONFIG.COLORS;
+  const s = app.summary;
+  const t = s.trend;
+  let trendSub = 'feature users ÷ DAU', trendColor = null;
+  if (t && t.ctrChangePp != null) {
+    const pp = t.ctrChangePp;
+    trendSub = (pp > 0 ? '▲ +' : pp < 0 ? '▼ −' : '■ ') + fmtNum_(Math.abs(pp), 2) + ' pp vs previous ' + t.windowDays + ' days';
+    trendColor = pp > 0 ? C.okInk : pp < 0 ? C.red : C.muted;
+  }
+  const cards = [
+    { label: app.app.toUpperCase() + ' DAU', value: fmtNum_(s.avgDau), sub: 'avg users/day · ' + s.days + ' days', accent: C.blue },
+    {
+      label: data.feature.toUpperCase() + ' USERS / DAY',
+      value: fmtNum_(s.avgFeatureUsers, 1),
+      sub: s.peakFeatureUsersDay ? 'peak ' + fmtNum_(s.peakFeatureUsersDay.featureUsers) + ' on ' + formatShortDate_(s.peakFeatureUsersDay.date) : 'avg per day',
+      accent: app.color
+    },
+    { label: 'CTR · DAU → ' + data.feature.toUpperCase(), value: fmtPct_(s.ctrPct, 2), sub: trendSub, subColor: trendColor, accent: C.greenDark },
+    s.uniqueUsers != null ? {
+      label: 'UNIQUE USERS · ' + s.days + ' DAYS',
+      value: fmtNum_(s.uniqueUsers),
+      sub: fmtNum_(s.repeatUsers) + ' repeat (active ≥2 days) · ' + fmtPct_(s.repeatRatePct, 0),
+      accent: C.returning
+    } : { label: 'FEATURE USER-DAYS', value: fmtNum_(s.totalFeatureUserDays), sub: 'sum of daily users', accent: C.returning }
+  ];
+  const gap = 8;
+  const w = (box.w - gap * (cards.length - 1)) / cards.length;
+  cards.forEach((card, i) => drawKpiCard_(slide, box.x + i * (w + gap), box.y, w, box.h, card));
+}
+
+/**
+ * Single-app funnel: DAU → clicked the feature → came back (returning), all on one scale,
+ * with drop-off notes between steps and a CTR callout on the right.
+ */
+function drawAppFunnel_(slide, data, app, box) {
+  const C = LS_CONFIG.COLORS;
+  const s = app.summary;
+  const hasSplit = s.avgReturningUsers != null;
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase() + (hasSplit ? ' → KEMBALI' : ''), box.x + 10, box.y + 8, 260);
+
+  const callout = { x: box.x + box.w - 118, y: box.y + 26, w: 108, h: box.h - 34 };
+  const col = { badge: box.x + 10, label: box.x + 28, track: box.x + 110 };
+  col.labelW = col.track - col.label - 6;
+  col.trackW = callout.x - 12 - col.track;
+
+  const steps = [
+    { name: 'Daily Active Users', value: s.avgDau, ratio: 1, color: app.soft, valueColor: app.color, note: 'avg users/day' },
+    { name: 'Klik ' + data.feature, value: s.avgFeatureUsers, ratio: (s.ctrPct || 0) / 100, color: app.color, note: fmtPct_(s.ctrPct, 2) + ' of DAU' }
+  ];
+  if (hasSplit) {
+    steps.push({
+      name: 'Kembali lagi', value: s.avgReturningUsers, ratio: s.avgDau > 0 ? s.avgReturningUsers / s.avgDau : 0,
+      color: C.returning, note: fmtPct_(s.returningSharePct, 0) + ' of clickers were returning'
+    });
+  }
+
+  const rowH = 16, step = steps.length === 3 ? 27 : 36;
+  const rowY = i => box.y + 28 + i * step;
+  const connector = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, col.badge + 6, rowY(0) + rowH / 2, col.badge + 6, rowY(steps.length - 1) + rowH / 2);
+  connector.getLineFill().setSolidFill(C.border);
+  connector.setWeight(1);
+
+  steps.forEach((st, i) => {
+    const y = rowY(i), cy = y + rowH / 2;
+    rect_(slide, SlidesApp.ShapeType.ELLIPSE, col.badge, cy - 6, 12, 12, i === 0 ? app.color : st.color, C.white, 1);
+    addText_(slide, String(i + 1), col.badge, cy - 6, 12, 12, { fontSize: 6, bold: true, color: C.white, align: 'CENTER', valign: 'MIDDLE' });
+    addText_(slide, st.name, col.label, y, col.labelW, rowH, { fontSize: fitFontSize_([st.name], col.labelW, 9, 7, 6, 0, true), bold: true, color: C.ink, valign: 'MIDDLE' });
+
+    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, col.trackW, 12, C.track);
+    const fillW = st.value > 0 ? Math.max(4, col.trackW * st.ratio) : 0;
+    if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, fillW, 12, st.color);
+    if (fillW >= 40) {
+      addText_(slide, fmtNum_(st.value, 1), col.track, y, fillW - 6, rowH, { fontSize: 7, bold: true, color: st.valueColor || C.white, align: 'END', valign: 'MIDDLE' });
+    } else {
+      const ox = col.track + fillW + 5;
+      addRichText_(slide, [
+        { text: fmtNum_(st.value, 1), bold: true, color: C.ink },
+        { text: '  ·  ' + st.note, color: C.muted }
+      ], ox, y, col.track + col.trackW - ox, rowH, { fontSize: 6.5, valign: 'MIDDLE' });
+    }
+  });
+
+  // Drop-off notes between steps
+  const gapNote = (i, parts) => addRichText_(slide, parts, col.track, rowY(i) + rowH + 1, col.trackW, step - rowH - 2, { fontSize: 5.5, valign: 'MIDDLE' });
+  if (s.ctrPct != null) {
+    gapNote(0, [{ text: '▼ ' + fmtPct_(100 - s.ctrPct, 2), bold: true, color: C.red }, { text: ' of DAU did not open ' + data.feature, color: C.muted }]);
+  }
+  if (hasSplit && s.avgFeatureUsers > 0) {
+    gapNote(1, [
+      { text: fmtNum_(s.avgNewUsers, 1) + ' new', bold: true, color: app.color },
+      { text: ' (' + fmtPct_(100 - s.returningSharePct, 0) + ') per day are first-time users', color: C.muted }
+    ]);
+  }
+
+  // Best / lowest day
+  if (s.bestDay && s.worstDay) {
+    const statsY = box.y + box.h - 15;
+    hLine_(slide, box.x + 10, callout.x - 12, statsY - 3, C.border, 0.5);
+    addRichText_(slide, [
+      { text: 'Best day  ', color: C.muted },
+      { text: formatShortDate_(s.bestDay.date) + ' · ' + fmtPct_(s.bestDay.ctrPct, 2), bold: true, color: C.okInk },
+      { text: '  (' + fmtNum_(s.bestDay.featureUsers) + ' of ' + fmtNum_(s.bestDay.dau) + ')', color: C.muted },
+      { text: '      Lowest  ', color: C.muted },
+      { text: formatShortDate_(s.worstDay.date) + ' · ' + fmtPct_(s.worstDay.ctrPct, 2), bold: true, color: C.red },
+      { text: '  (' + fmtNum_(s.worstDay.featureUsers) + ' of ' + fmtNum_(s.worstDay.dau) + ')', color: C.muted }
+    ], box.x + 10, statsY, callout.x - 22 - box.x, 10, { fontSize: 6, valign: 'MIDDLE' });
+  }
+
+  // CTR callout with benchmark against the other apps
+  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, callout.x, callout.y, callout.w, callout.h, app.soft);
+  addText_(slide, 'CLICK-THROUGH RATE', callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  addText_(slide, fmtPct_(s.ctrPct, 2), callout.x + 6, callout.y + 17, callout.w - 12, 22, { fontSize: 19, bold: true, color: app.color, align: 'CENTER', valign: 'MIDDLE' });
+  addText_(slide, 'of ' + app.app + ' DAU open ' + data.feature, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+
+  const t = s.trend;
+  if (t && t.ctrChangePp != null) {
+    const pp = t.ctrChangePp, up = pp > 0, flat = pp === 0;
+    pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', callout.x + 14, callout.y + 53, callout.w - 28, 12,
+      flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 6.5);
+    addText_(slide, t.label, callout.x + 6, callout.y + 67, callout.w - 12, 7, { fontSize: 5, color: C.muted, align: 'CENTER' });
+  }
+  const others = data.apps.filter(a => a !== app);
+  if (others.length) {
+    addText_(slide, 'vs ' + others.map(o => o.app + ' ' + fmtPct_(o.summary.ctrPct, 2)).join(' · '),
+      callout.x + 6, callout.y + callout.h - 12, callout.w - 12, 7, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  }
+}
+
+/** Single app: feature users as stacked bars (new / returning, right axis), app DAU as a line (left axis). */
+function drawAppDailyChart_(slide, app, box) {
+  const C = LS_CONFIG.COLORS;
+  const rows = app.dailySeries;
+  const n = rows.length;
+  const detailed = n <= 14;
+  const hasSplit = rows.every(r => r.newUsers != null && r.returningUsers != null);
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'DAILY TREND · ' + app.app.toUpperCase(), box.x + 10, box.y + 8, 130);
+
+  const legend = [{ label: 'DAU (left)', color: C.blue, kind: 'line' }];
+  if (hasSplit) legend.push({ label: 'New', color: app.color, kind: 'bar' }, { label: 'Returning (right)', color: C.returning, kind: 'bar' });
+  else legend.push({ label: 'Feature users (right)', color: app.color, kind: 'bar' });
+  if (detailed) legend.push({ label: '% = CTR', color: C.greenDark, kind: 'text' });
+  let lx = box.x + box.w - 10;
+  legend.slice().reverse().forEach(item => {
+    const tw = estimateTextWidth_(item.label, 6);
+    lx -= tw;
+    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: item.kind === 'text' ? C.greenDark : C.ink, valign: 'MIDDLE' });
+    if (item.kind === 'line') {
+      lx -= 13;
+      hLine_(slide, lx, lx + 10, box.y + 13.5, item.color, 2);
+    } else if (item.kind === 'bar') {
+      lx -= 10;
+      rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, box.y + 10, 7, 7, item.color);
+    }
+    lx -= 10;
+  });
+
+  const plot = { x: box.x + 34, y: box.y + 30, w: box.w - 34 - 34, h: box.h - 30 - (detailed ? 22 : 14) };
+  const maxDau = niceMax_(Math.max(1, ...rows.map(r => r.dau)));
+  // Bars use a taller scale so they stay in the lower part of the plot, clear of the DAU line
+  const maxUsers = niceMax_(Math.max(1, ...rows.map(r => r.featureUsers)) * 1.6);
+  const band = plot.w / n;
+  const px = i => plot.x + (i + 0.5) * band;
+  const yOf = (v, max) => plot.y + plot.h - (v / max) * plot.h;
+
+  [0, 0.5, 1].forEach(fr => {
+    const gy = plot.y + plot.h - fr * plot.h;
+    const line = hLine_(slide, plot.x, plot.x + plot.w, gy, fr === 0 ? C.border : C.grid, fr === 0 ? 0.75 : 0.5);
+    if (fr > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
+    addText_(slide, fmtNum_(maxDau * fr, maxDau < 10 ? 1 : 0), box.x + 6, gy - 4, plot.x - box.x - 10, 8, { fontSize: 5.5, color: C.blue, align: 'END', valign: 'MIDDLE' });
+    addText_(slide, fmtNum_(maxUsers * fr, 1), plot.x + plot.w + 4, gy - 4, 24, 8, { fontSize: 5.5, color: app.color, valign: 'MIDDLE' });
+  });
+
+  // Stacked bars: new at the bottom, returning on top
+  const barW = Math.max(2, Math.min(16, band * 0.55));
+  const base = plot.y + plot.h;
+  rows.forEach((r, i) => {
+    const segments = hasSplit ? [[r.newUsers, app.color], [r.returningUsers, C.returning]] : [[r.featureUsers, app.color]];
+    let y = base;
+    segments.forEach(seg => {
+      const h = (seg[0] / maxUsers) * plot.h;
+      if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, px(i) - barW / 2, y - h, barW, h, seg[1]);
+      y -= h;
+    });
+    if (detailed) {
+      addText_(slide, fmtNum_(r.featureUsers), px(i) - 15, y - 9, 30, 8, { fontSize: 5.5, bold: true, color: C.ink, align: 'CENTER', valign: 'MIDDLE' });
+    }
+  });
+
+  // DAU line + markers
+  for (let i = 1; i < n; i++) {
+    const line = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, px(i - 1), yOf(rows[i - 1].dau, maxDau), px(i), yOf(rows[i].dau, maxDau));
+    line.getLineFill().setSolidFill(C.blue);
+    line.setWeight(1.75);
+  }
+  if (detailed) {
+    rows.forEach((r, i) => {
+      const y = yOf(r.dau, maxDau);
+      rect_(slide, SlidesApp.ShapeType.ELLIPSE, px(i) - 2.25, y - 2.25, 4.5, 4.5, C.blue, C.white, 0.75);
+      addText_(slide, fmtNum_(r.dau), px(i) - 15, y - 11, 30, 8, { fontSize: 5.5, bold: true, color: C.blue, align: 'CENTER', valign: 'MIDDLE' });
+    });
+  }
+
+  // X-axis: date (+ CTR when detailed), thinned out for long ranges
+  const every = Math.ceil(n / 8);
+  const labelIdx = [];
+  for (let i = 0; i < n; i += every) labelIdx.push(i);
+  if (labelIdx[labelIdx.length - 1] !== n - 1) {
+    if (n - 1 - labelIdx[labelIdx.length - 1] < every * 0.6) labelIdx.pop();
+    labelIdx.push(n - 1);
+  }
+  labelIdx.forEach(i => {
+    const parts = [{ text: formatShortDate_(rows[i].date), color: C.muted }];
+    if (detailed) parts.push({ text: '\n' + fmtPct_(rows[i].ctrPct, 2), color: C.greenDark, bold: true });
+    addRichText_(slide, parts, px(i) - 22, plot.y + plot.h + 3, 44, detailed ? 16 : 8, { fontSize: 5.5, align: 'CENTER' });
   });
 }
 
