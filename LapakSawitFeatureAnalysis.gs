@@ -42,28 +42,35 @@ const LS_CONFIG = {
       label: 'AgenPRO',
       color: '#31512B',
       soft: '#DCE8D5',
-      description: 'App for agents: view TBS data, register DO, join the Panen Emas loyalty program, manage their members ' +
-        '(pengurus, drivers/supir, other members and plantation/kebun data) and register pengurus into the Protim program.'
+      // Sent to Gemini: describe the users only, never other feature names (Gemini would build actions around them)
+      description: 'App for agents (agen) who buy FFB/TBS from farmers and deliver it to mills, and who manage their own team ' +
+        '(pengurus, drivers, members and plantation data).'
     },
     {
       key: 'timpro',
       label: 'TimPRO',
       color: '#C2410C',
       soft: '#FDE3CF',
-      description: 'Loyalty & operational app for pengurus: join the Protim program and affiliate program, view TBS delivery ' +
-        'reports and look for palm fruit to buy/sell (Lapak Sawit).'
+      description: 'Operational app for pengurus, the field coordinators working under an agent who organise FFB/TBS deliveries ' +
+        'and look for palm fruit to buy or sell.'
     }
   ],
   FALLBACK_APP_COLORS: [{ color: '#2563EB', soft: '#DBEAFE' }, { color: '#7C3AED', soft: '#EDE9FE' }],
 
-  // Product context sent to Gemini
-  FEATURE_CONTEXT: [
-    'Panen Emas: loyalty program for agents; agents claim tonnage in the app every time they deliver fruit (FFB/TBS) to a partner mill.',
-    'Protim: appreciation loyalty program for pengurus; pengurus claim tonnage in the TimPRO app for each fruit delivery, ' +
+  // Feature descriptions. Only the feature being analysed is sent to Gemini; the others stay out of the prompt
+  // so the AI cannot tie its recommendations to them.
+  FEATURE_CONTEXT: {
+    'Lapak Sawit': 'Marketplace connecting agents and farmers (petani) to run FFB transactions. Available in both AgenPRO and TimPRO.',
+    'Panen Emas': 'Loyalty program for agents; agents claim tonnage in the app every time they deliver fruit (FFB/TBS) to a partner mill.',
+    'Protim': 'Appreciation loyalty program for pengurus; pengurus claim tonnage in the TimPRO app for each fruit delivery, ' +
       'but only after the agent has first claimed it in Panen Emas.',
-    'Laporan TBS: TBS (fresh fruit bunch) delivery report, available after every delivery.',
-    'Lapak Sawit: marketplace connecting agents and farmers (petani) to run FFB transactions. Available in both AgenPRO and TimPRO.'
-  ],
+    'Laporan TBS': 'TBS (fresh fruit bunch) delivery report, available after every delivery.'
+  },
+  // Terms that must not appear in AI output for another feature's slide (besides the other FEATURE_CONTEXT names).
+  OFF_TOPIC_PATTERNS: [/panen\s*emas/i, /\bprotim\b/i, /laporan\s*(tbs|pengiriman)/i, /delivery\s*report/i, /affiliat|afiliasi/i,
+    /loyal/i, /tonnage|tonase/i, /\bDO\b/, /delivery\s*order/i],
+  // Extra Gemini rounds asking it to rewrite an answer that still mentions other features
+  GEMINI_MAX_RETRIES: 2,
 
   // Slides text boxes carry built-in padding that SlidesApp cannot change.
   // addText_ expands every box by these insets so text lands exactly on the layout grid.
@@ -207,7 +214,12 @@ function generateLapakSawitSlide() {
     });
 
     presentationUrl = 'https://docs.google.com/presentation/d/' + presentation.getId() + '/edit';
-    const issues = analysisInput.dataQualityIssues;
+    const issues = analysisInput.dataQualityIssues.slice();
+    aiResults.forEach((ai, i) => {
+      if (ai.removedOffTopic) {
+        issues.push('AI text mentioning other features removed on ' + (specs[i].app ? specs[i].app.app : 'summary') + ' slide (' + ai.removedOffTopic + ' item(s))');
+      }
+    });
     const message = specs.length + ' slide(s) generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' +
       (issues.length ? ' Data warnings: ' + issues.join('; ') : '');
     logRun_(ss, issues.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);
@@ -578,32 +590,92 @@ function round2_(n) {
 
 /* ------------------------------ GEMINI API ------------------------------ */
 
-/** One Gemini request per slide (focusApp = null for the summary slide), sent in parallel. */
+/**
+ * One Gemini request per slide (focusApp = null for the summary slide), sent in parallel.
+ * Answers that still mention other features are sent back for a rewrite; anything left after the retries is removed.
+ */
 function callGeminiAll_(data, focusApps) {
   const apiKey = PropertiesService.getScriptProperties().getProperty(LS_CONFIG.API_KEY_PROPERTY);
   if (!apiKey) throw new Error('Gemini API key missing in Script Properties.');
 
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(LS_CONFIG.GEMINI_MODEL) + ':generateContent';
-  const requests = focusApps.map(app => ({
+  const request = contents => ({
     url: url,
     method: 'post',
     contentType: 'application/json',
     headers: { 'x-goog-api-key': apiKey },
-    payload: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: buildGeminiPrompt_(data, app) }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
-    }),
+    payload: JSON.stringify({ contents: contents, generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }),
     muteHttpExceptions: true
-  }));
-
-  return UrlFetchApp.fetchAll(requests).map((response, i) => {
-    if (response.getResponseCode() !== 200) {
-      throw new Error('Gemini API error (' + (focusApps[i] ? focusApps[i].app : 'summary') + '): ' + response.getContentText());
-    }
-    const envelope = JSON.parse(response.getContentText());
-    return normalizeAi_(JSON.parse(envelope.candidates[0].content.parts[0].text));
   });
+
+  const conversations = focusApps.map(app => [{ role: 'user', parts: [{ text: buildGeminiPrompt_(data, app) }] }]);
+  const results = [];
+  let pending = focusApps.map((_, i) => i);
+  for (let attempt = 0; pending.length && attempt <= LS_CONFIG.GEMINI_MAX_RETRIES; attempt++) {
+    const responses = UrlFetchApp.fetchAll(pending.map(i => request(conversations[i])));
+    const retry = [];
+    responses.forEach((response, k) => {
+      const i = pending[k];
+      if (response.getResponseCode() !== 200) {
+        throw new Error('Gemini API error (' + (focusApps[i] ? focusApps[i].app : 'summary') + '): ' + response.getContentText());
+      }
+      const text = JSON.parse(response.getContentText()).candidates[0].content.parts[0].text;
+      results[i] = normalizeAi_(JSON.parse(text));
+      const offending = offTopicTexts_(results[i], data.feature);
+      if (offending.length && attempt < LS_CONFIG.GEMINI_MAX_RETRIES) {
+        conversations[i].push(
+          { role: 'model', parts: [{ text: text }] },
+          { role: 'user', parts: [{ text: 'Your answer breaks the rule that ' + data.feature + ' is the only feature you may mention. ' +
+            'These parts mention other features or programs:\n- ' + offending.join('\n- ') + '\n' +
+            'Rewrite the whole JSON. Every observation and action must be about ' + data.feature + ' only ' +
+            '(campaigns, ads, push/WhatsApp, in-app reminders, the ' + data.feature + ' flow, user follow-up, investigating specific dates).' }] }
+        );
+        retry.push(i);
+      }
+    });
+    pending = retry;
+  }
+  return results.map((ai, i) => removeOffTopic_(ai, data, focusApps[i]));
+}
+
+function offTopicPatterns_(feature) {
+  const others = Object.keys(LS_CONFIG.FEATURE_CONTEXT)
+    .filter(name => name.toLowerCase() !== feature.toLowerCase())
+    .map(name => new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*'), 'i'));
+  // Skip patterns that would match the analysed feature itself
+  return others.concat(LS_CONFIG.OFF_TOPIC_PATTERNS).filter(re => !re.test(feature));
+}
+
+function isOffTopic_(text, feature) {
+  return offTopicPatterns_(feature).some(re => re.test(String(text || '')));
+}
+
+/** Slide texts (and speaker-note sentences) that mention another feature. */
+function offTopicTexts_(ai, feature) {
+  const texts = [ai.headline].concat(ai.observations, ai.nextSteps.map(s => s.action + ' [PIC: ' + s.pic + ']'), splitSentences_(ai.speakerNotes));
+  return texts.filter(t => isOffTopic_(t, feature));
+}
+
+/** Last resort after the retries: drop whatever still mentions another feature. */
+function removeOffTopic_(ai, data, focusApp) {
+  const feature = data.feature;
+  const before = offTopicTexts_(ai, feature).length;
+  if (!before) return ai;
+  const scope = focusApp ? focusApp.summary : data.combined;
+  return {
+    headline: isOffTopic_(ai.headline, feature)
+      ? (focusApp ? focusApp.app + ' ' : '') + feature + ' CTR ' + fmtPct_(scope.ctrPct, 2) + ' over ' + data.dataPeriod.days + ' days.'
+      : ai.headline,
+    observations: ai.observations.filter(o => !isOffTopic_(o, feature)),
+    nextSteps: ai.nextSteps.filter(s => !isOffTopic_(s.action + ' ' + s.pic, feature)),
+    speakerNotes: splitSentences_(ai.speakerNotes).filter(t => !isOffTopic_(t, feature)).join(' '),
+    removedOffTopic: before
+  };
+}
+
+function splitSentences_(text) {
+  return String(text || '').split(/(?<=[.!?])\s+/).filter(Boolean);
 }
 
 function buildGeminiPrompt_(data, focusApp) {
@@ -634,12 +706,10 @@ function buildGeminiPrompt_(data, focusApp) {
     'You are analyzing the "' + data.feature + '" feature.',
     '',
     'PRODUCT CONTEXT',
-    'SawitPRO has 2 app versions:',
+    'The feature: ' + data.feature + ' — ' + (LS_CONFIG.FEATURE_CONTEXT[data.feature] || 'a SawitPRO app feature') + '.',
+    'It is available in these app versions:',
     appLines.join('\n'),
-    'Features:',
-    LS_CONFIG.FEATURE_CONTEXT.map(l => '- ' + l).join('\n'),
-    'Users of AgenPRO are agents; users of TimPRO are pengurus. Interpret differences between the apps in light of these roles.',
-    'The other features are listed ONLY so you understand who the users are and what else they do in the app.',
+    'Interpret differences between the apps in light of who their users are.',
     '',
     scope.join('\n'),
     '',
@@ -668,7 +738,9 @@ function buildGeminiPrompt_(data, focusApp) {
     '- Good action types: a ' + data.feature + ' campaign or promo, ads, push notification / WhatsApp blast, in-app banner or reminder for ' + data.feature + ', ' +
       'improving the ' + data.feature + ' flow or content, following up a user segment (new users who never came back, repeat users), ' +
       'or investigating a specific date that spiked or dropped.',
-    '- Do NOT recommend integrating, linking or bundling ' + data.feature + ' with other features (Panen Emas, Protim, Laporan TBS, DO, affiliate, etc.), and do not recommend changes to other features.',
+    '- ' + data.feature + ' is the ONLY feature you may name. Do not mention, link to, bundle with or recommend changes to any other ' +
+      'SawitPRO feature, program, report or module (no loyalty programs, reward/tonnage claims, delivery reports, DO, affiliate).',
+    '- This applies to the headline, observations and speaker notes too, not only next_steps.',
     '- At least one action must name a specific date from summary.notableDays (or bestDay / worstDay) and say what to check ' +
       '(e.g. a campaign or broadcast sent that day, FFB price or supply changes, listings available, app release or bug, holiday or harvest day).',
     '- Each action must follow from a number in DATA; mention that number briefly when it fits.',
