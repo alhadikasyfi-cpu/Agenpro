@@ -1,9 +1,10 @@
 /**
  * Lapak Sawit Feature Analysis — Google Apps Script
  * Duplicates the SawitPRO master template (slide 1) and renders a feature analysis snapshot:
- * KPI cards, DAU → feature funnel, daily trend chart and Gemini-generated insights.
+ * KPI cards, DAU → feature funnel per app (AgenPRO / TimPRO), daily CTR chart and Gemini insights.
  *
- * Source: sheet "Daily Metrics", one row per date (and feature). Rows are read from row 2 down to
+ * Source: the sheet named after the feature (e.g. "Lapak Sawit"), one row per date per app
+ * (feature_name = "Lapak Sawit Agenpro", "Lapak Sawit Timpro", ...). Rows are read from row 2 down to
  * the first empty row; columns are matched by header name, so their order does not matter.
  */
 
@@ -11,20 +12,55 @@ const LS_CONFIG = {
   GEMINI_MODEL: 'gemini-3.5-flash-lite',
   PRESENTATION_PROPERTY: 'LAPAK_SAWIT_PRESENTATION_ID',
   API_KEY_PROPERTY: 'GEMINI_API_KEY',
-  SHEET_DAILY: 'Daily Metrics',
+  FEATURE_NAME: 'Lapak Sawit', // also the name of the source sheet
   SHEET_LOG: 'Run Log',
-  FEATURE_NAME: 'Lapak Sawit',
+  OUTPUT_LANGUAGE: 'English',
   FONT: 'Arial',
 
-  // Accepted header names per field (lower-case). Optional fields may be absent.
+  // Accepted header names per field, after normalising (lower-case, non-alphanumerics → "_").
   DAILY_COLUMNS: {
     date: ['tanggal', 'date'],
-    feature: ['feature_name', 'feature'],
+    feature: ['feature_name', 'feature', 'app'],
     dau: ['daily_active_users', 'dau'],
     featureUsers: ['feature_unique_users', 'feature_users', 'unique_users'],
-    penetration: ['penetration_rate_pct', 'penetration_pct', 'penetration']
+    newUsers: ['new_users', 'new_user'],
+    returningUsers: ['returning_users', 'returning_user', 'return_users'],
+    penetration: ['penetration_rate_pct', 'penetration_pct'],
+    userNames: ['user_names', 'usernames', 'names']
   },
+  // Fallback for per-feature user columns such as "feature_lapaksawit_users"
+  FEATURE_USERS_PATTERN: /^feature_.+_users$/,
   REQUIRED_COLUMNS: ['date', 'dau', 'featureUsers'],
+
+  // App variants, in display order. `key` is matched against feature_name minus the feature name.
+  APPS: [
+    {
+      key: 'agenpro',
+      label: 'AgenPRO',
+      color: '#31512B',
+      soft: '#DCE8D5',
+      description: 'App for agents: view TBS data, register DO, join the Panen Emas loyalty program, manage their members ' +
+        '(pengurus, drivers/supir, other members and plantation/kebun data) and register pengurus into the Protim program.'
+    },
+    {
+      key: 'timpro',
+      label: 'TimPRO',
+      color: '#C2410C',
+      soft: '#FDE3CF',
+      description: 'Loyalty & operational app for pengurus: join the Protim program and affiliate program, view TBS delivery ' +
+        'reports and look for palm fruit to buy/sell (Lapak Sawit).'
+    }
+  ],
+  FALLBACK_APP_COLORS: [{ color: '#2563EB', soft: '#DBEAFE' }, { color: '#7C3AED', soft: '#EDE9FE' }],
+
+  // Product context sent to Gemini
+  FEATURE_CONTEXT: [
+    'Panen Emas: loyalty program for agents; agents claim tonnage in the app every time they deliver fruit (FFB/TBS) to a partner mill.',
+    'Protim: appreciation loyalty program for pengurus; pengurus claim tonnage in the TimPRO app for each fruit delivery, ' +
+      'but only after the agent has first claimed it in Panen Emas.',
+    'Laporan TBS: TBS (fresh fruit bunch) delivery report, available after every delivery.',
+    'Lapak Sawit: marketplace connecting agents and farmers (petani) to run FFB transactions. Available in both AgenPRO and TimPRO.'
+  ],
 
   // Slides text boxes carry built-in padding that SlidesApp cannot change.
   // addText_ expands every box by these insets so text lands exactly on the layout grid.
@@ -67,8 +103,8 @@ const LS_CONFIG = {
   LAYOUT: {
     title: { x: 20, y: 54, w: 680, h: 18 },
     kpi: { x: 20, y: 78, w: 420, h: 42 },
-    funnel: { x: 20, y: 126, w: 420, h: 124 },
-    chart: { x: 20, y: 256, w: 420, h: 108 },
+    funnel: { x: 20, y: 126, w: 420, h: 130 },
+    chart: { x: 20, y: 262, w: 420, h: 102 },
     observations: { x: 452, y: 78, w: 248, h: 162 },
     actions: { x: 452, y: 246, w: 248, h: 118 }
   }
@@ -87,17 +123,16 @@ function onOpen() {
 
 function setupLapakSawit() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const daily = getOrCreateSheet_(ss, LS_CONFIG.SHEET_DAILY);
+  const data = getOrCreateSheet_(ss, LS_CONFIG.FEATURE_NAME);
   const log = getOrCreateSheet_(ss, LS_CONFIG.SHEET_LOG);
 
-  setupTab_(daily, ['tanggal', 'feature_name', 'daily_active_users', 'feature_unique_users', 'penetration_rate_pct'], [
-    [20261018, 'Lapak Sawit', 172, 4, 2.33],
-    [20261017, 'Lapak Sawit', 176, 3, 1.7],
-    [20261016, 'Lapak Sawit', 234, 10, 4.27],
-    [20261015, 'Lapak Sawit', 205, 5, 2.44]
+  setupTab_(data, ['tanggal', 'feature_name', 'daily_active_users', 'feature_lapaksawit_users', 'New_users', 'Returning user',
+    'Return user pct', 'penetration_rate_pct', 'user_names'], [
+    ['15/10/2026', 'Lapak Sawit Agenpro', 205, 2, 2, 0, 0, 0.98, 'user a, user b'],
+    ['15/10/2026', 'Lapak Sawit Timpro', 134, 1, 1, 0, 0, 0.75, 'user c']
   ]);
   setupTab_(log, ['run_at', 'status', 'message', 'presentation_url'], []);
-  [daily, log].forEach(sh => {
+  [data, log].forEach(sh => {
     sh.setFrozenRows(1);
     sh.autoResizeColumns(1, sh.getLastColumn());
   });
@@ -136,8 +171,8 @@ function generateLapakSawitSlide() {
   let presentationUrl = '';
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const rows = readDailyMetrics_(ss);
-    const analysisInput = buildAnalysisInput_(rows);
+    const sheet = readFeatureSheet_(ss);
+    const analysisInput = buildAnalysisInput_(sheet);
     const ai = callGemini_(analysisInput);
 
     const presentation = getOrCreatePresentation_();
@@ -157,7 +192,7 @@ function generateLapakSawitSlide() {
 
     presentationUrl = 'https://docs.google.com/presentation/d/' + presentation.getId() + '/edit';
     const issues = analysisInput.dataQualityIssues;
-    const message = 'Slide generated (' + analysisInput.dataPeriod.days + ' days).' +
+    const message = 'Slide generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' +
       (issues.length ? ' Data warnings: ' + issues.join('; ') : '');
     logRun_(ss, issues.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);
 
@@ -190,27 +225,33 @@ function setupTab_(sheet, headers, sampleRows) {
   sheet.getRange(1, 1, 1, headers.length).setBackground(LS_CONFIG.COLORS.greenDark).setFontColor('#FFFFFF').setFontWeight('bold');
 }
 
-/** Reads "Daily Metrics" from row 2 down to the first fully empty row; columns are located by header name. */
-function readDailyMetrics_(ss) {
-  const sheetName = LS_CONFIG.SHEET_DAILY;
+function normalizeHeader_(h) {
+  return String(h == null ? '' : h).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+/** Reads the feature sheet from row 2 down to the first fully empty row; columns are located by header name. */
+function readFeatureSheet_(ss) {
+  const sheetName = LS_CONFIG.FEATURE_NAME;
   const sheet = ss.getSheetByName(sheetName);
   if (!sheet) throw new Error('Missing sheet "' + sheetName + '".');
   const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
   if (lastRow < 2) throw new Error('Sheet "' + sheetName + '" has no data rows.');
 
   const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
-  const headers = values[0].map(v => String(v).trim().toLowerCase());
+  const headers = values[0].map(normalizeHeader_);
   const col = {};
   Object.keys(LS_CONFIG.DAILY_COLUMNS).forEach(field => {
     const names = LS_CONFIG.DAILY_COLUMNS[field];
     col[field] = headers.findIndex(h => names.indexOf(h) >= 0);
   });
+  if (col.featureUsers < 0) col.featureUsers = headers.findIndex(h => LS_CONFIG.FEATURE_USERS_PATTERN.test(h));
   LS_CONFIG.REQUIRED_COLUMNS.forEach(field => {
     if (col[field] < 0) {
       throw new Error('Sheet "' + sheetName + '" is missing column "' + LS_CONFIG.DAILY_COLUMNS[field].join('" / "') + '".');
     }
   });
 
+  const optionalNumber = (row, field) => (col[field] >= 0 && row[col[field]] !== '' ? toNumber_(row[col[field]]) : null);
   const rows = [];
   for (let r = 1; r < values.length; r++) {
     const row = values[r];
@@ -221,19 +262,24 @@ function readDailyMetrics_(ss) {
       feature: col.feature >= 0 ? String(row[col.feature] || '').trim() : '',
       dau: toNumber_(row[col.dau]),
       featureUsers: toNumber_(row[col.featureUsers]),
-      penetration: col.penetration >= 0 && row[col.penetration] !== '' ? toNumber_(row[col.penetration]) : null
+      newUsers: optionalNumber(row, 'newUsers'),
+      returningUsers: optionalNumber(row, 'returningUsers'),
+      penetration: optionalNumber(row, 'penetration'),
+      names: col.userNames >= 0 ? parseNames_(row[col.userNames]) : null
     });
   }
   if (!rows.length) throw new Error('Sheet "' + sheetName + '" has no data before the first empty row.');
-  return rows;
+  return { rows: rows, hasNames: col.userNames >= 0 };
 }
 
-/** Accepts real dates, yyyyMMdd (number or text) and yyyy-MM-dd. */
+/** Accepts real dates, dd/MM/yyyy, yyyyMMdd (number or text) and yyyy-MM-dd. */
 function parseDate_(value) {
   if (value instanceof Date && !isNaN(value.getTime())) return new Date(value.getFullYear(), value.getMonth(), value.getDate());
   if (value === '' || value == null) return null;
   const s = String(value).trim();
-  let m = s.match(/^(\d{4})(\d{2})(\d{2})$/) || s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  m = s.match(/^(\d{4})(\d{2})(\d{2})$/) || s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -244,87 +290,169 @@ function toNumber_(value) {
   return isFinite(n) ? n : 0;
 }
 
-/** Keeps the rows of the configured feature (or the only feature present). */
-function selectFeatureRows_(rows) {
-  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  const names = rows.map(r => r.feature).filter(Boolean).filter((n, i, all) => all.findIndex(x => norm(x) === norm(n)) === i);
-  const target = norm(LS_CONFIG.FEATURE_NAME);
-  if (!names.length) return { feature: LS_CONFIG.FEATURE_NAME, rows: rows };
-  const match = names.find(n => norm(n) === target);
-  if (match) return { feature: match, rows: rows.filter(r => !r.feature || norm(r.feature) === target) };
-  if (names.length === 1) return { feature: names[0], rows: rows };
-  throw new Error('Feature "' + LS_CONFIG.FEATURE_NAME + '" not found. Features in sheet: ' + names.join(', '));
+function parseNames_(value) {
+  return String(value == null ? '' : value).split(',').map(s => s.trim()).filter(Boolean);
 }
 
-function buildAnalysisInput_(rawRows) {
-  const issues = [];
-  const selected = selectFeatureRows_(rawRows);
+function nameKey_(name) {
+  return String(name).toLowerCase().replace(/\s+/g, ' ').trim();
+}
 
-  // One row per date, validated
+/** "Lapak Sawit Agenpro" → AgenPRO config entry (or a generated one for unknown apps). */
+function resolveApp_(featureName, fallbackIndex) {
+  const rest = String(featureName || '').toLowerCase().replace(LS_CONFIG.FEATURE_NAME.toLowerCase(), '').replace(/[^a-z0-9]+/g, '');
+  const known = LS_CONFIG.APPS.find(a => a.key === rest);
+  if (known) return known;
+  const fallback = LS_CONFIG.FALLBACK_APP_COLORS[fallbackIndex % LS_CONFIG.FALLBACK_APP_COLORS.length];
+  const label = String(featureName || '').replace(new RegExp(LS_CONFIG.FEATURE_NAME, 'i'), '').trim() || LS_CONFIG.FEATURE_NAME;
+  return { key: rest || 'all', label: label, color: fallback.color, soft: fallback.soft, description: '' };
+}
+
+function buildAnalysisInput_(sheet) {
+  const issues = [];
+
+  // Group rows per app (feature_name)
+  const groups = {};
+  sheet.rows.forEach(r => {
+    const name = r.feature || LS_CONFIG.FEATURE_NAME;
+    (groups[name] = groups[name] || []).push(r);
+  });
+  const appOrder = key => {
+    const i = LS_CONFIG.APPS.findIndex(a => a.key === key);
+    return i < 0 ? LS_CONFIG.APPS.length : i;
+  };
+  const apps = Object.keys(groups)
+    .map((name, i) => analyzeApp_(name, resolveApp_(name, i), groups[name], sheet.hasNames, issues))
+    .filter(Boolean)
+    .sort((a, b) => appOrder(a.key) - appOrder(b.key) || a.app.localeCompare(b.app));
+  if (!apps.length) throw new Error('No valid rows in sheet "' + LS_CONFIG.FEATURE_NAME + '".');
+
+  const allDates = {};
+  apps.forEach(a => a.dailySeries.forEach(r => allDates[r.date] = true));
+  const dates = Object.keys(allDates).sort();
+
+  // Combined view across apps
+  const totalDau = apps.reduce((acc, a) => acc + a.summary.totalDauUserDays, 0);
+  const totalFeature = apps.reduce((acc, a) => acc + a.summary.totalFeatureUserDays, 0);
+  let combinedUnique = null, combinedRepeat = null;
+  if (sheet.hasNames) {
+    const days = {};
+    apps.forEach(a => a._nameDays && Object.keys(a._nameDays).forEach(k => {
+      days[k] = days[k] || {};
+      Object.keys(a._nameDays[k]).forEach(d => days[k][d] = true);
+    }));
+    combinedUnique = Object.keys(days).length;
+    combinedRepeat = Object.keys(days).filter(k => Object.keys(days[k]).length >= 2).length;
+  }
+  apps.forEach(a => delete a._nameDays); // user names stay inside the script; never sent to Gemini
+
+  return {
+    feature: LS_CONFIG.FEATURE_NAME,
+    funnelDefinition: 'Per app: Step 1 = app Daily Active Users (DAU); Step 2 = users who clicked/opened ' + LS_CONFIG.FEATURE_NAME +
+      '. CTR (penetration) = feature users / DAU. Feature users split into new (first time) and returning users.',
+    unitsNote: 'Summed daily feature users are user-days. uniqueUsers counts distinct user names over the whole period; ' +
+      'repeatUsers = users active on 2 or more distinct days.',
+    dataPeriod: { start: dates[0], end: dates[dates.length - 1], days: dates.length },
+    combined: {
+      avgDau: apps.reduce((acc, a) => acc + a.summary.avgDau, 0),
+      avgFeatureUsers: round1_(apps.reduce((acc, a) => acc + a.summary.avgFeatureUsers, 0)),
+      ctrPct: totalDau > 0 ? round2_((totalFeature / totalDau) * 100) : null,
+      totalDauUserDays: totalDau,
+      totalFeatureUserDays: totalFeature,
+      uniqueUsers: combinedUnique,
+      repeatUsers: combinedRepeat
+    },
+    apps: apps,
+    dataQualityIssues: issues
+  };
+}
+
+function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
+  const tag = appDef.label + ' ';
   const byDate = {};
-  selected.rows.forEach(r => {
+  rows.forEach(r => {
     if (!r.date) {
-      issues.push('Row ' + r.rowNumber + ': unreadable date (row skipped)');
+      issues.push(tag + 'row ' + r.rowNumber + ': unreadable date (row skipped)');
       return;
     }
     const key = dateKey_(r.date);
     if (byDate[key]) {
-      issues.push('Duplicate date ' + key + ' (row ' + r.rowNumber + ' skipped)');
+      issues.push(tag + 'duplicate date ' + key + ' (row ' + r.rowNumber + ' skipped)');
       return;
     }
-    const penetrationPct = r.dau > 0 ? round2_((r.featureUsers / r.dau) * 100) : null;
-    if (r.featureUsers > r.dau) issues.push(key + ': feature users (' + r.featureUsers + ') exceed DAU (' + r.dau + ')');
-    if (r.penetration != null && penetrationPct != null && Math.abs(r.penetration - penetrationPct) > 0.05) {
-      issues.push(key + ': penetration_rate_pct ' + r.penetration + ' differs from computed ' + penetrationPct);
+    const ctr = r.dau > 0 ? round2_((r.featureUsers / r.dau) * 100) : null;
+    if (r.featureUsers > r.dau) issues.push(tag + key + ': feature users exceed DAU');
+    if (r.penetration != null && ctr != null && Math.abs(r.penetration - ctr) > 0.05) {
+      issues.push(tag + key + ': penetration_rate_pct ' + r.penetration + ' differs from computed ' + ctr);
     }
-    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, penetrationPct: penetrationPct };
+    if (r.newUsers != null && r.returningUsers != null && r.newUsers + r.returningUsers !== r.featureUsers) {
+      issues.push(tag + key + ': new + returning (' + (r.newUsers + r.returningUsers) + ') ≠ feature users (' + r.featureUsers + ')');
+    }
+    if (r.names && r.names.length && r.names.length !== r.featureUsers) {
+      issues.push(tag + key + ': ' + r.names.length + ' user names vs ' + r.featureUsers + ' feature users');
+    }
+    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: ctr, names: r.names || [] };
   });
 
-  const series = Object.keys(byDate).sort().map(k => byDate[k]);
-  if (!series.length) throw new Error('No valid rows for feature "' + selected.feature + '".');
+  const full = Object.keys(byDate).sort().map(k => byDate[k]);
+  if (!full.length) return null;
 
-  const days = series.length;
-  const start = series[0].date, end = series[days - 1].date;
-  const spanDays = Math.round((parseDate_(end).getTime() - parseDate_(start).getTime()) / 86400000) + 1;
-  if (spanDays > days) issues.push((spanDays - days) + ' missing date(s) between ' + start + ' and ' + end);
+  const days = full.length;
+  const spanDays = Math.round((parseDate_(full[days - 1].date).getTime() - parseDate_(full[0].date).getTime()) / 86400000) + 1;
+  if (spanDays > days) issues.push(tag + (spanDays - days) + ' missing date(s) between ' + full[0].date + ' and ' + full[days - 1].date);
 
-  const sum = (rows, key) => rows.reduce((acc, r) => acc + r[key], 0);
-  const totalDau = sum(series, 'dau');
-  const totalFeatureUsers = sum(series, 'featureUsers');
-  const penetrationPct = totalDau > 0 ? round2_((totalFeatureUsers / totalDau) * 100) : null;
-  const withPen = series.filter(r => r.penetrationPct != null);
-  const pick = (rows, better) => rows.reduce((best, r) => (best == null || better(r, best) ? r : best), null);
+  // Unique and repeat users from the name lists
+  let nameDays = null, uniqueUsers = null, repeatUsers = null, maxActiveDays = null;
+  if (hasNames) {
+    nameDays = {};
+    full.forEach(r => r.names.forEach(n => {
+      const k = nameKey_(n);
+      nameDays[k] = nameDays[k] || {};
+      nameDays[k][r.date] = true;
+    }));
+    const counts = Object.keys(nameDays).map(k => Object.keys(nameDays[k]).length);
+    uniqueUsers = counts.length;
+    repeatUsers = counts.filter(c => c >= 2).length;
+    maxActiveDays = counts.length ? Math.max(...counts) : 0;
+  }
+
+  const series = full.map(r => ({ date: r.date, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }));
+  const sum = key => series.reduce((acc, r) => acc + (r[key] || 0), 0);
+  const totalDau = sum('dau'), totalFeature = sum('featureUsers');
+  const hasSplit = series.every(r => r.newUsers != null && r.returningUsers != null);
+  const withCtr = series.filter(r => r.ctrPct != null);
+  const pick = better => withCtr.reduce((best, r) => (best == null || better(r, best) ? r : best), null);
 
   return {
-    feature: selected.feature,
-    funnelDefinition: 'Step 1 = app Daily Active Users (DAU); Step 2 = users who clicked/opened the feature (feature_unique_users). Conversion = penetration = feature users / DAU.',
-    unitsNote: 'Totals of feature users are user-days (sum of daily unique users), not unique users across the whole period.',
-    dataPeriod: { start: start, end: end, days: days, calendarDays: spanDays },
+    key: appDef.key,
+    app: appDef.label,
+    featureName: featureName,
+    appDescription: appDef.description,
+    color: appDef.color,
+    soft: appDef.soft,
     summary: {
+      days: days,
       avgDau: Math.round(totalDau / days),
-      avgFeatureUsers: round1_(totalFeatureUsers / days),
+      avgFeatureUsers: round1_(totalFeature / days),
+      ctrPct: totalDau > 0 ? round2_((totalFeature / totalDau) * 100) : null,
       totalDauUserDays: totalDau,
-      totalFeatureUserDays: totalFeatureUsers,
-      penetrationPct: penetrationPct,
-      avgDailyPenetrationPct: withPen.length ? round2_(sum(withPen, 'penetrationPct') / withPen.length) : null,
-      bestDay: pick(withPen, (a, b) => a.penetrationPct > b.penetrationPct),
-      worstDay: pick(withPen, (a, b) => a.penetrationPct < b.penetrationPct),
-      peakFeatureUsersDay: pick(series, (a, b) => a.featureUsers > b.featureUsers),
+      totalFeatureUserDays: totalFeature,
+      avgNewUsers: hasSplit ? round1_(sum('newUsers') / days) : null,
+      avgReturningUsers: hasSplit ? round1_(sum('returningUsers') / days) : null,
+      returningSharePct: hasSplit && totalFeature > 0 ? round1_((sum('returningUsers') / totalFeature) * 100) : null,
+      uniqueUsers: uniqueUsers,
+      repeatUsers: repeatUsers,
+      repeatRatePct: uniqueUsers ? round1_((repeatUsers / uniqueUsers) * 100) : null,
+      maxActiveDaysBySingleUser: maxActiveDays,
+      bestDay: pick((a, b) => a.ctrPct > b.ctrPct),
+      worstDay: pick((a, b) => a.ctrPct < b.ctrPct),
       latestDay: series[days - 1],
       previousDay: days > 1 ? series[days - 2] : null,
       trend: compareWindows_(series)
     },
-    funnel: {
-      steps: [
-        { name: 'Daily Active Users', avgPerDay: Math.round(totalDau / days), total: totalDau },
-        { name: 'Klik ' + selected.feature, avgPerDay: round1_(totalFeatureUsers / days), total: totalFeatureUsers }
-      ],
-      conversionPct: penetrationPct,
-      dropOffPct: penetrationPct == null ? null : round2_(100 - penetrationPct)
-    },
     patterns: buildPatterns_(series),
     dailySeries: series,
-    dataQualityIssues: issues
+    _nameDays: nameDays
   };
 }
 
@@ -335,15 +463,15 @@ function compareWindows_(series) {
   const recent = series.slice(-size), prior = series.slice(-2 * size, -size);
   const agg = rows => {
     const dau = rows.reduce((a, r) => a + r.dau, 0), users = rows.reduce((a, r) => a + r.featureUsers, 0);
-    return { avgDau: dau / rows.length, avgUsers: users / rows.length, penetration: dau > 0 ? (users / dau) * 100 : null };
+    return { avgDau: dau / rows.length, avgUsers: users / rows.length, ctr: dau > 0 ? (users / dau) * 100 : null };
   };
   const a = agg(recent), b = agg(prior);
   return {
     label: 'last ' + size + ' vs previous ' + size + ' days',
     windowDays: size,
-    recentPenetrationPct: a.penetration == null ? null : round2_(a.penetration),
-    priorPenetrationPct: b.penetration == null ? null : round2_(b.penetration),
-    penetrationChangePp: a.penetration == null || b.penetration == null ? null : round2_(a.penetration - b.penetration),
+    recentCtrPct: a.ctr == null ? null : round2_(a.ctr),
+    priorCtrPct: b.ctr == null ? null : round2_(b.ctr),
+    ctrChangePp: a.ctr == null || b.ctr == null ? null : round2_(a.ctr - b.ctr),
     featureUsersChangePct: pctChange_(a.avgUsers, b.avgUsers),
     dauChangePct: pctChange_(a.avgDau, b.avgDau)
   };
@@ -351,13 +479,13 @@ function compareWindows_(series) {
 
 /** Statistical patterns that are only reported once there is enough data to be meaningful. */
 function buildPatterns_(series) {
-  const pens = series.filter(r => r.penetrationPct != null);
+  const ctrs = series.filter(r => r.ctrPct != null);
   const out = {};
-  if (pens.length >= 7) {
-    const mean = pens.reduce((a, r) => a + r.penetrationPct, 0) / pens.length;
-    const sd = Math.sqrt(pens.reduce((a, r) => a + Math.pow(r.penetrationPct - mean, 2), 0) / pens.length);
-    out.penetrationStdDevPp = round2_(sd);
-    out.anomalies = sd > 0 ? pens.filter(r => Math.abs(r.penetrationPct - mean) > 2 * sd).map(r => ({ date: r.date, penetrationPct: r.penetrationPct })) : [];
+  if (ctrs.length >= 7) {
+    const mean = ctrs.reduce((a, r) => a + r.ctrPct, 0) / ctrs.length;
+    const sd = Math.sqrt(ctrs.reduce((a, r) => a + Math.pow(r.ctrPct - mean, 2), 0) / ctrs.length);
+    out.ctrStdDevPp = round2_(sd);
+    out.anomalies = sd > 0 ? ctrs.filter(r => Math.abs(r.ctrPct - mean) > 2 * sd).map(r => ({ date: r.date, ctrPct: r.ctrPct })) : [];
   }
   if (series.length >= 10) {
     out.dauVsFeatureUsersCorrelation = round2_(correlation_(series.map(r => r.dau), series.map(r => r.featureUsers)));
@@ -370,9 +498,9 @@ function buildPatterns_(series) {
       b.dau += r.dau;
       b.users += r.featureUsers;
     });
-    out.penetrationByWeekday = names
-      .map((n, i) => ({ day: n, penetrationPct: buckets[i].dau > 0 ? round2_((buckets[i].users / buckets[i].dau) * 100) : null }))
-      .filter(d => d.penetrationPct != null);
+    out.ctrByWeekday = names
+      .map((n, i) => ({ day: n, ctrPct: buckets[i].dau > 0 ? round2_((buckets[i].users / buckets[i].dau) * 100) : null }))
+      .filter(d => d.ctrPct != null);
   }
   return out;
 }
@@ -411,23 +539,37 @@ function callGemini_(data) {
   const apiKey = PropertiesService.getScriptProperties().getProperty(LS_CONFIG.API_KEY_PROPERTY);
   if (!apiKey) throw new Error('Gemini API key missing in Script Properties.');
 
+  const appLines = LS_CONFIG.APPS.map(a => '- ' + a.label + ': ' + a.description);
   const prompt = [
-    'You are a senior product analytics consultant analyzing the "' + data.feature + '" feature of the SawitPRO app (used by palm-oil farmers and agents).',
+    'You are a senior product analytics consultant at SawitPRO (palm-oil / FFB supply chain platform in Indonesia).',
+    'You are analyzing the "' + data.feature + '" feature.',
+    '',
+    'PRODUCT CONTEXT',
+    'SawitPRO has 2 app versions:',
+    appLines.join('\n'),
+    'Features:',
+    LS_CONFIG.FEATURE_CONTEXT.map(l => '- ' + l).join('\n'),
+    'Users of AgenPRO are agents; users of TimPRO are pengurus. Interpret differences between the apps in light of these roles.',
+    '',
+    'METRICS',
     'Funnel: ' + data.funnelDefinition,
     'Units: ' + data.unitsNote,
+    '',
     'Output must be valid JSON matching this schema:',
     '{',
     '  "headline": "Clear single executive takeaway sentence",',
     '  "observations": ["Observation 1", "Observation 2", "Observation 3"],',
     '  "next_steps": [{"action": "Actionable item description", "pic": "Owner/Team"}],',
-    '  "speaker_notes": "A detailed, professional presentation script. Explain the DAU-to-feature conversion, day-to-day variation, the trend comparison, any data quality warnings, and the reasoning behind each recommendation."',
+    '  "speaker_notes": "A detailed, professional presentation script. Explain the DAU-to-feature funnel per app, the AgenPRO vs TimPRO comparison, new vs returning and repeat users, the trend, any data quality warnings, and the reasoning behind each recommendation."',
     '}',
     '',
     'Rules (the slide has limited space, keep on-slide text short):',
-    '- Ground every statement in DATA and quote numbers exactly as given.',
-    '- Never describe summed feature users as unique users for the period.',
+    '- Write in ' + LS_CONFIG.OUTPUT_LANGUAGE + '.',
+    '- Ground every statement in DATA and quote numbers exactly as given; always say which app a number belongs to.',
+    '- Never describe summed feature users as unique users; use uniqueUsers for distinct users.',
     '- If dataPeriod.days < 7, state that trends are preliminary.',
     '- If dataQualityIssues is not empty, mention the most important one in an observation.',
+    '- Recommendations must fit the product context (e.g. link Lapak Sawit to Panen Emas, Protim or Laporan TBS moments where relevant).',
     '- headline: one sentence, max 20 words.',
     '- observations: exactly 3 items, each max 24 words, no leading bullet characters.',
     '- next_steps: exactly 3 items; "action" max 16 words; "pic" is a short team name (max 4 words).',
@@ -513,38 +655,23 @@ function drawTitle_(slide, data, box) {
 
 function drawKpiCards_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
-  const s = data.summary;
-  const latest = s.latestDay, prev = s.previousDay;
-
-  let latestSub = fmtPct_(latest.penetrationPct, 2) + ' penetration';
-  let latestColor = C.muted, latestAccent = C.greenDark;
-  if (prev) {
-    const diff = latest.featureUsers - prev.featureUsers;
-    latestSub = (diff > 0 ? '▲ +' : diff < 0 ? '▼ −' : '■ ') + fmtNum_(Math.abs(diff)) + ' vs ' + formatShortDate_(prev.date) + ' · ' + fmtPct_(latest.penetrationPct, 2);
-    latestColor = diff > 0 ? C.okInk : diff < 0 ? C.red : C.muted;
-    latestAccent = diff > 0 ? C.greenLine : diff < 0 ? C.red : C.muted;
-  }
+  const c = data.combined;
+  const perApp = fn => data.apps.map(a => a.app + ' ' + fn(a.summary)).join(' · ');
 
   const cards = [
-    { label: 'AVG DAILY ACTIVE (APP)', value: fmtNum_(s.avgDau), sub: 'users/day · ' + data.dataPeriod.days + ' days', accent: C.blue },
-    {
-      label: 'AVG FEATURE USERS',
-      value: fmtNum_(s.avgFeatureUsers, 1),
-      sub: s.peakFeatureUsersDay ? 'per day · peak ' + fmtNum_(s.peakFeatureUsersDay.featureUsers) + ' on ' + formatShortDate_(s.peakFeatureUsersDay.date) : 'per day',
-      accent: C.greenBar
-    },
-    {
-      label: 'PENETRATION',
-      value: fmtPct_(s.penetrationPct, 2),
-      sub: s.worstDay ? 'range ' + fmtPct_(s.worstDay.penetrationPct, 2) + ' – ' + fmtPct_(s.bestDay.penetrationPct, 2) : 'feature users / DAU',
-      accent: C.greenDark
-    },
-    {
-      label: 'LATEST · ' + formatShortDate_(latest.date).toUpperCase(),
-      value: fmtNum_(latest.featureUsers) + ' users',
-      sub: latestSub,
-      subColor: latestColor,
-      accent: latestAccent
+    { label: 'AVG DAU · ALL APPS', value: fmtNum_(c.avgDau), sub: perApp(s => fmtNum_(s.avgDau)), accent: C.blue },
+    { label: data.feature.toUpperCase() + ' USERS / DAY', value: fmtNum_(c.avgFeatureUsers, 1), sub: perApp(s => fmtNum_(s.avgFeatureUsers, 1)), accent: C.greenBar },
+    { label: 'CTR · DAU → ' + data.feature.toUpperCase(), value: fmtPct_(c.ctrPct, 2), sub: perApp(s => fmtPct_(s.ctrPct, 2)), accent: C.greenDark },
+    c.uniqueUsers != null ? {
+      label: 'UNIQUE USERS · ' + data.dataPeriod.days + ' DAYS',
+      value: fmtNum_(c.uniqueUsers),
+      sub: fmtNum_(c.repeatUsers) + ' repeat (active ≥2 days) · ' + fmtPct_(c.uniqueUsers ? (c.repeatUsers / c.uniqueUsers) * 100 : null, 0),
+      accent: C.amber
+    } : {
+      label: 'FEATURE USER-DAYS',
+      value: fmtNum_(c.totalFeatureUserDays),
+      sub: 'sum of daily users · ' + data.dataPeriod.days + ' days',
+      accent: C.amber
     }
   ];
   const gap = 8;
@@ -557,174 +684,157 @@ function drawKpiCard_(slide, x, y, w, h, card) {
   rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, x, y, w, h, C.cardBg, C.border);
   rect_(slide, SlidesApp.ShapeType.RECTANGLE, x, y + 7, 3, h - 14, card.accent);
 
-  addText_(slide, card.label, x + 10, y + 5, w - 14, 8, { fontSize: 6, bold: true, color: C.muted });
+  const labelSize = fitFontSize_([card.label], w - 14, 8, 6, 5, 0, true);
+  addText_(slide, card.label, x + 10, y + 5, w - 14, 8, { fontSize: labelSize, bold: true, color: C.muted });
   addText_(slide, card.value, x + 10, y + 14, w - 14, 16, { fontSize: 15, bold: true, color: C.ink, valign: 'MIDDLE' });
-  addText_(slide, card.sub, x + 10, y + 31, w - 14, 7, { fontSize: 5.5, color: card.subColor || C.muted, bold: !!card.subColor && card.subColor !== C.muted });
+  const subSize = fitFontSize_([card.sub], w - 14, 7, 5.5, 4.5, 0);
+  addText_(slide, card.sub, x + 10, y + 31, w - 14, 7, { fontSize: subSize, color: card.subColor || C.muted });
 }
 
 /**
- * Two-step funnel: app DAU → users who clicked the feature (average per day).
- * Left: step rows on a shared track so the drop is visible to scale. Right: conversion callout + trend.
+ * DAU → feature funnel, one block per app. Each block: DAU bar (full track) and feature-user bar drawn to the
+ * same scale, CTR with trend vs the prior window, and unique / repeat users for the period.
  */
 function drawFunnel_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
-  const f = data.funnel, s = data.summary;
-  const steps = f.steps;
+  const apps = data.apps;
 
   panel_(slide, box);
-  sectionTitle_(slide, 'FEATURE FUNNEL', box.x + 10, box.y + 8, 120);
-  addText_(slide, 'Average per day · ' + data.dataPeriod.days + ' days', box.x + 140, box.y + 8, 150, 11, { fontSize: 6, color: C.muted, valign: 'MIDDLE' });
+  sectionTitle_(slide, 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase(), box.x + 10, box.y + 8, 220);
+  addText_(slide, 'Average per day · ' + data.dataPeriod.days + ' days', box.x + box.w - 160, box.y + 8, 150, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
 
-  const callout = { x: box.x + box.w - 120, y: box.y + 26, w: 110, h: box.h - 34 };
-  const col = { badge: box.x + 10, label: box.x + 28, track: box.x + 112 };
-  col.labelW = col.track - col.label - 6;
-  col.trackW = callout.x - 12 - col.track;
+  const col = { app: box.x + 10, appW: 46, step: box.x + 62, stepW: 34, track: box.x + 100, ctr: box.x + box.w - 108, ctrW: 50, uniq: box.x + box.w - 56, uniqW: 46 };
+  col.trackW = col.ctr - 10 - col.track;
 
-  const rowH = 22;
-  const rowY = [box.y + 30, box.y + 66];
-  const colors = [C.greenDark, C.greenBar];
+  const headY = box.y + 24;
+  [['APP', col.app, col.appW, 'START'], ['FUNNEL STEP (AVG / DAY)', col.step, col.trackW + col.stepW, 'START'],
+    ['CTR', col.ctr, col.ctrW, 'CENTER'], ['UNIQUE USERS', col.uniq, col.uniqW, 'CENTER']]
+    .forEach(h => addText_(slide, h[0], h[1], headY, h[2], 7, { fontSize: 5.5, bold: true, color: C.muted, align: h[3] }));
+  hLine_(slide, box.x + 10, box.x + box.w - 10, headY + 9, C.border, 0.5);
 
-  const connector = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, col.badge + 6, rowY[0] + rowH / 2, col.badge + 6, rowY[1] + rowH / 2);
-  connector.getLineFill().setSolidFill(C.border);
-  connector.setWeight(1);
+  const top = box.y + 37, bottom = box.y + box.h - 15;
+  const blockH = Math.min(46, (bottom - top) / apps.length);
+  const rowH = Math.min(16, (blockH - 6) / 2);
 
-  steps.forEach((step, i) => {
-    const y = rowY[i], cy = y + rowH / 2;
-    rect_(slide, SlidesApp.ShapeType.ELLIPSE, col.badge, cy - 6, 12, 12, colors[i], C.white, 1);
-    addText_(slide, String(i + 1), col.badge, cy - 6, 12, 12, { fontSize: 6, bold: true, color: C.white, align: 'CENTER', valign: 'MIDDLE' });
+  apps.forEach((a, i) => {
+    const s = a.summary;
+    const y0 = top + i * blockH;
+    const rowA = y0, rowB = y0 + rowH + 2;
+    if (i > 0) hLine_(slide, box.x + 10, box.x + box.w - 10, y0 - 2.5, C.grid, 0.5);
 
-    const labelSize = fitFontSize_([step.name], col.labelW, 9, 7, 6, 0, true);
-    addText_(slide, step.name, col.label, y, col.labelW, rowH, { fontSize: labelSize, bold: true, color: C.ink, valign: 'MIDDLE' });
+    // App chip
+    pill_(slide, a.app, col.app, y0 + rowH + 1 - 7, col.appW, 14, a.color, C.white, 6.5);
 
-    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 7, col.trackW, 14, C.track);
-    const ratio = i === 0 ? 1 : (f.conversionPct || 0) / 100;
-    const fillW = step.avgPerDay > 0 ? Math.max(5, col.trackW * ratio) : 0;
-    if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 7, fillW, 14, colors[i]);
+    // Step 1: DAU (full track)
+    addText_(slide, 'DAU', col.step, rowA, col.stepW, rowH, { fontSize: 6, color: C.muted, bold: true, valign: 'MIDDLE' });
+    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowA + rowH / 2 - 6, col.trackW, 12, a.soft);
+    addText_(slide, fmtNum_(s.avgDau), col.track, rowA, col.trackW - 6, rowH, { fontSize: 7, bold: true, color: a.color, align: 'END', valign: 'MIDDLE' });
 
-    if (fillW >= 34) {
-      addText_(slide, fmtNum_(step.avgPerDay, 1), col.track, y, fillW - 6, rowH, { fontSize: 7.5, bold: true, color: C.white, align: 'END', valign: 'MIDDLE' });
-    } else {
-      const ox = col.track + fillW + 5;
-      addRichText_(slide, [
-        { text: fmtNum_(step.avgPerDay, 1), bold: true, color: C.ink },
-        { text: '  ·  ' + fmtPct_(f.conversionPct, 2) + ' of DAU', color: C.muted }
-      ], ox, y, col.track + col.trackW - ox, rowH, { fontSize: 7, valign: 'MIDDLE' });
+    // Step 2: feature users, same scale as DAU
+    addText_(slide, 'Klik', col.step, rowB, col.stepW, rowH, { fontSize: 6, color: C.ink, bold: true, valign: 'MIDDLE' });
+    rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowB + rowH / 2 - 6, col.trackW, 12, C.track);
+    const fillW = s.avgFeatureUsers > 0 ? Math.max(4, col.trackW * (s.ctrPct || 0) / 100) : 0;
+    if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowB + rowH / 2 - 6, fillW, 12, a.color);
+    const parts = [{ text: fmtNum_(s.avgFeatureUsers, 1), bold: true, color: C.ink }];
+    if (s.avgNewUsers != null) {
+      parts.push(
+        { text: '   new ', color: C.muted }, { text: fmtNum_(s.avgNewUsers, 1), bold: true, color: C.ink },
+        { text: '  ·  returning ', color: C.muted }, { text: fmtNum_(s.avgReturningUsers, 1), bold: true, color: C.ink },
+        { text: ' (' + fmtPct_(s.returningSharePct, 0) + ')', color: C.muted }
+      );
+    }
+    const ox = col.track + fillW + 5;
+    addRichText_(slide, parts, ox, rowB, col.track + col.trackW - ox, rowH, { fontSize: 6, valign: 'MIDDLE' });
+
+    // CTR + trend
+    addText_(slide, fmtPct_(s.ctrPct, 2), col.ctr, rowA, col.ctrW, rowH, { fontSize: 11, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
+    const t = s.trend;
+    if (t && t.ctrChangePp != null) {
+      const pp = t.ctrChangePp, up = pp > 0, flat = pp === 0;
+      pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', col.ctr + 2, rowB + rowH / 2 - 5.5, col.ctrW - 4, 11,
+        flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 5.5);
+    }
+
+    // Unique / repeat users
+    addText_(slide, s.uniqueUsers == null ? '–' : fmtNum_(s.uniqueUsers), col.uniq, rowA, col.uniqW, rowH, { fontSize: 11, bold: true, color: C.ink, align: 'CENTER', valign: 'MIDDLE' });
+    if (s.uniqueUsers != null) {
+      addText_(slide, fmtNum_(s.repeatUsers) + ' repeat', col.uniq, rowB, col.uniqW, rowH, { fontSize: 5.5, color: C.muted, align: 'CENTER', valign: 'MIDDLE' });
     }
   });
 
-  // Drop-off between the two steps
-  if (f.dropOffPct != null) {
-    addRichText_(slide, [
-      { text: '▼ ' + fmtPct_(f.dropOffPct, 2), bold: true, color: C.red },
-      { text: ' of DAU did not open ' + data.feature, color: C.muted }
-    ], col.track, rowY[0] + rowH + 2, col.trackW, 10, { fontSize: 6, valign: 'MIDDLE' });
-  }
-
-  // Best / lowest day
-  if (s.bestDay && s.worstDay) {
-    const statsY = box.y + box.h - 22;
-    hLine_(slide, box.x + 10, callout.x - 12, statsY - 3, C.border, 0.5);
-    addRichText_(slide, [
-      { text: 'Best day  ', color: C.muted },
-      { text: formatShortDate_(s.bestDay.date) + ' · ' + fmtPct_(s.bestDay.penetrationPct, 2), bold: true, color: C.okInk },
-      { text: '  (' + fmtNum_(s.bestDay.featureUsers) + ' of ' + fmtNum_(s.bestDay.dau) + ')', color: C.muted },
-      { text: '      Lowest  ', color: C.muted },
-      { text: formatShortDate_(s.worstDay.date) + ' · ' + fmtPct_(s.worstDay.penetrationPct, 2), bold: true, color: C.red },
-      { text: '  (' + fmtNum_(s.worstDay.featureUsers) + ' of ' + fmtNum_(s.worstDay.dau) + ')', color: C.muted }
-    ], box.x + 10, statsY, callout.x - 22 - box.x, 12, { fontSize: 6, valign: 'MIDDLE' });
-  }
-
-  // Conversion callout
-  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, callout.x, callout.y, callout.w, callout.h, C.greenSoft);
-  addText_(slide, 'CLICK-THROUGH RATE', callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
-  addText_(slide, fmtPct_(f.conversionPct, 2), callout.x + 6, callout.y + 17, callout.w - 12, 22, { fontSize: 19, bold: true, color: C.greenDark, align: 'CENTER', valign: 'MIDDLE' });
-  addText_(slide, 'of DAU open ' + data.feature, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
-
-  const t = s.trend;
-  if (t && t.penetrationChangePp != null) {
-    const pp = t.penetrationChangePp;
-    const up = pp > 0, flat = pp === 0;
-    const text = (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp';
-    pill_(slide, text, callout.x + 14, callout.y + 56, callout.w - 28, 12,
-      flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 6.5);
-    addText_(slide, t.label, callout.x + 6, callout.y + 71, callout.w - 12, 8, { fontSize: 5, color: C.muted, align: 'CENTER' });
-  }
+  const trendLabel = apps[0].summary.trend ? apps[0].summary.trend.label : 'prior period';
+  addText_(slide, 'CTR = users who clicked ÷ DAU  ·  pp = CTR change, ' + trendLabel + '  ·  unique = distinct user_names; repeat = active on ≥2 days',
+    box.x + 10, box.y + box.h - 11, box.w - 20, 7, { fontSize: 5, color: C.muted });
 }
 
-/** Feature users as bars (right axis) with app DAU as a line (left axis); penetration under each date when space allows. */
+/** Daily CTR per app; point labels when the range is short enough to read them. */
 function drawDailyChart_(slide, data, box) {
   const C = LS_CONFIG.COLORS;
-  const rows = data.dailySeries;
-  const n = rows.length;
+  const apps = data.apps;
+  const dates = [];
+  apps.forEach(a => a.dailySeries.forEach(r => dates.indexOf(r.date) < 0 && dates.push(r.date)));
+  dates.sort();
+  const n = dates.length;
   const detailed = n <= 14;
 
   panel_(slide, box);
-  sectionTitle_(slide, 'DAILY TREND', box.x + 10, box.y + 8, 80);
+  sectionTitle_(slide, 'DAILY CTR BY APP', box.x + 10, box.y + 8, 120);
 
   // Legend, right-aligned on the title row
-  const legend = [
-    { label: 'App DAU (left)', color: C.blue, kind: 'line' },
-    { label: 'Feature users (right)', color: C.greenBar, kind: 'bar' }
-  ];
-  if (detailed) legend.push({ label: '% = penetration', color: C.greenDark, kind: 'text' });
   let lx = box.x + box.w - 10;
-  legend.slice().reverse().forEach(item => {
-    const tw = estimateTextWidth_(item.label, 6);
+  apps.slice().reverse().forEach(a => {
+    const label = a.app + '  (avg ' + fmtPct_(a.summary.ctrPct, 2) + ')';
+    const tw = estimateTextWidth_(label, 6);
     lx -= tw;
-    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: item.kind === 'text' ? C.greenDark : C.ink, valign: 'MIDDLE' });
-    if (item.kind === 'line') {
-      lx -= 13;
-      hLine_(slide, lx, lx + 10, box.y + 13.5, item.color, 2);
-    } else if (item.kind === 'bar') {
-      lx -= 10;
-      rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, box.y + 10, 7, 7, item.color);
-    }
+    addText_(slide, label, lx, box.y + 8, tw, 11, { fontSize: 6, color: C.ink, valign: 'MIDDLE' });
+    lx -= 13;
+    hLine_(slide, lx, lx + 10, box.y + 13.5, a.color, 2);
     lx -= 12;
   });
 
-  const plot = { x: box.x + 34, y: box.y + 30, w: box.w - 34 - 34, h: box.h - 30 - (detailed ? 24 : 16) };
-  const maxDau = niceMax_(Math.max(1, ...rows.map(r => r.dau)));
-  // Bars use a taller scale so they stay in the lower part of the plot, clear of the DAU line
-  const maxUsers = niceMax_(Math.max(1, ...rows.map(r => r.featureUsers)) * 1.6);
+  const plot = { x: box.x + 34, y: box.y + 32, w: box.w - 34 - 16, h: box.h - 32 - 16 };
+  const maxCtr = niceMax_(Math.max(1, ...apps.map(a => Math.max(...a.dailySeries.map(r => r.ctrPct || 0)))));
   const band = plot.w / n;
+  // Reserve room under the zero line for labels placed below low points
+  const baseY = plot.y + plot.h - (detailed ? 9 : 0);
+  const valueH = baseY - plot.y;
   const px = i => plot.x + (i + 0.5) * band;
-  const yOf = (v, max) => plot.y + plot.h - (v / max) * plot.h;
+  const py = v => baseY - (v / maxCtr) * valueH;
 
-  // Gridlines + dual axis labels
   [0, 0.5, 1].forEach(fr => {
-    const gy = plot.y + plot.h - fr * plot.h;
+    const gy = baseY - fr * valueH;
     const line = hLine_(slide, plot.x, plot.x + plot.w, gy, fr === 0 ? C.border : C.grid, fr === 0 ? 0.75 : 0.5);
     if (fr > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
-    addText_(slide, fmtNum_(maxDau * fr, maxDau < 10 ? 1 : 0), box.x + 6, gy - 4, plot.x - box.x - 10, 8, { fontSize: 5.5, color: C.blue, align: 'END', valign: 'MIDDLE' });
-    addText_(slide, fmtNum_(maxUsers * fr, maxUsers < 10 ? 1 : 0), plot.x + plot.w + 4, gy - 4, 24, 8, { fontSize: 5.5, color: C.greenBar, valign: 'MIDDLE' });
+    addText_(slide, fmtNum_(maxCtr * fr, 1) + '%', box.x + 4, gy - 4, plot.x - box.x - 8, 8, { fontSize: 5.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
   });
 
-  // Feature-user bars
-  const barW = Math.max(2, Math.min(16, band * 0.55));
-  rows.forEach((r, i) => {
-    const top = yOf(r.featureUsers, maxUsers);
-    const h = plot.y + plot.h - top;
-    if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, px(i) - barW / 2, top, barW, h, C.greenBar);
-    if (detailed) {
-      addText_(slide, fmtNum_(r.featureUsers), px(i) - 15, top - 9, 30, 8, { fontSize: 5.5, bold: true, color: C.greenDark, align: 'CENTER', valign: 'MIDDLE' });
+  // Lines + markers per app
+  const points = apps.map(a => {
+    const byDate = {};
+    a.dailySeries.forEach(r => byDate[r.date] = r.ctrPct);
+    return dates.map(d => (byDate[d] == null ? null : byDate[d]));
+  });
+  apps.forEach((a, ai) => {
+    const vals = points[ai];
+    for (let i = 1; i < n; i++) {
+      if (vals[i - 1] == null || vals[i] == null) continue;
+      const line = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, px(i - 1), py(vals[i - 1]), px(i), py(vals[i]));
+      line.getLineFill().setSolidFill(a.color);
+      line.setWeight(1.75);
     }
+    if (!detailed) return;
+    vals.forEach((v, i) => {
+      if (v == null) return;
+      rect_(slide, SlidesApp.ShapeType.ELLIPSE, px(i) - 2.25, py(v) - 2.25, 4.5, 4.5, a.color, C.white, 0.75);
+      // Label above the point for the higher series at this date, below for the lower one
+      const others = points.filter((_, j) => j !== ai).map(p => p[i]).filter(x => x != null);
+      const above = !others.length || v >= Math.max(...others);
+      addText_(slide, fmtPct_(v, 1), px(i) - 15, above ? py(v) - 11 : py(v) + 3, 30, 8,
+        { fontSize: 5.5, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
+    });
   });
 
-  // DAU line + markers
-  for (let i = 1; i < n; i++) {
-    const line = slide.insertLine(SlidesApp.LineCategory.STRAIGHT, px(i - 1), yOf(rows[i - 1].dau, maxDau), px(i), yOf(rows[i].dau, maxDau));
-    line.getLineFill().setSolidFill(C.blue);
-    line.setWeight(1.75);
-  }
-  if (detailed) {
-    rows.forEach((r, i) => {
-      const y = yOf(r.dau, maxDau);
-      rect_(slide, SlidesApp.ShapeType.ELLIPSE, px(i) - 2.25, y - 2.25, 4.5, 4.5, C.blue, C.white, 0.75);
-      addText_(slide, fmtNum_(r.dau), px(i) - 15, y - 11, 30, 8, { fontSize: 5.5, bold: true, color: C.blue, align: 'CENTER', valign: 'MIDDLE' });
-    });
-  }
-
-  // X-axis: date (+ penetration when detailed), thinned out for long ranges
+  // X-axis dates, thinned out for long ranges
   const every = Math.ceil(n / 8);
   const labelIdx = [];
   for (let i = 0; i < n; i += every) labelIdx.push(i);
@@ -734,10 +844,7 @@ function drawDailyChart_(slide, data, box) {
     labelIdx.push(n - 1);
   }
   labelIdx.forEach(i => {
-    const r = rows[i];
-    const parts = [{ text: formatShortDate_(r.date), color: C.muted }];
-    if (detailed) parts.push({ text: '\n' + fmtPct_(r.penetrationPct, 2), color: C.greenDark, bold: true });
-    addRichText_(slide, parts, px(i) - 22, plot.y + plot.h + 3, 44, detailed ? 16 : 8, { fontSize: 5.5, align: 'CENTER' });
+    addText_(slide, formatShortDate_(dates[i]), px(i) - 20, plot.y + plot.h + 3, 40, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
   });
 }
 
