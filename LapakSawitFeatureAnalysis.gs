@@ -461,6 +461,7 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
       repeatRatePct: uniqueUsers ? round1_((repeatUsers / uniqueUsers) * 100) : null,
       maxActiveDaysBySingleUser: maxActiveDays,
       peakFeatureUsersDay: series.reduce((best, r) => (best == null || r.featureUsers > best.featureUsers ? r : best), null),
+      notableDays: notableDays_(series),
       bestDay: pick((a, b) => a.ctrPct > b.ctrPct),
       worstDay: pick((a, b) => a.ctrPct < b.ctrPct),
       latestDay: series[days - 1],
@@ -471,6 +472,31 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
     dailySeries: series,
     _nameDays: nameDays
   };
+}
+
+/** Largest day-over-day CTR rise and drop, so Gemini can point at specific dates to investigate. */
+function notableDays_(series) {
+  const moves = [];
+  for (let i = 1; i < series.length; i++) {
+    const prev = series[i - 1], cur = series[i];
+    if (prev.ctrPct == null || cur.ctrPct == null) continue;
+    moves.push({
+      date: cur.date,
+      previousDate: prev.date,
+      ctrChangePp: round2_(cur.ctrPct - prev.ctrPct),
+      fromCtrPct: prev.ctrPct,
+      toCtrPct: cur.ctrPct,
+      featureUsers: cur.featureUsers,
+      previousFeatureUsers: prev.featureUsers,
+      dau: cur.dau,
+      previousDau: prev.dau,
+      newUsers: cur.newUsers,
+      returningUsers: cur.returningUsers
+    });
+  }
+  const rise = moves.filter(m => m.ctrChangePp > 0).sort((a, b) => b.ctrChangePp - a.ctrChangePp)[0] || null;
+  const drop = moves.filter(m => m.ctrChangePp < 0).sort((a, b) => a.ctrChangePp - b.ctrChangePp)[0] || null;
+  return { biggestRise: rise, biggestDrop: drop };
 }
 
 /** Recent window vs the window before it: 7 vs 7 days when there is enough data, otherwise half vs half. */
@@ -597,7 +623,7 @@ function buildGeminiPrompt_(data, focusApp) {
   const scope = focusApp ? [
     'SLIDE SCOPE: this slide covers ONLY ' + focusApp.app + ' (' + (focusApp.appDescription || 'app variant') + ').',
     'Analyze its funnel DAU → click ' + data.feature + ' → returning users. Use benchmarkOtherApps only as a brief comparison.',
-    'Recommendations must suit the ' + focusApp.app + ' users and what they do in that app.'
+    'Recommendations must suit the ' + focusApp.app + ' users (who they are is described in PRODUCT CONTEXT).'
   ] : [
     'SLIDE SCOPE: executive summary comparing all apps side by side (' + data.apps.map(a => a.app).join(' vs ') + ').',
     'Explain which app converts DAU to ' + data.feature + ' better and why that may be, given each app\'s users.'
@@ -613,6 +639,7 @@ function buildGeminiPrompt_(data, focusApp) {
     'Features:',
     LS_CONFIG.FEATURE_CONTEXT.map(l => '- ' + l).join('\n'),
     'Users of AgenPRO are agents; users of TimPRO are pengurus. Interpret differences between the apps in light of these roles.',
+    'The other features are listed ONLY so you understand who the users are and what else they do in the app.',
     '',
     scope.join('\n'),
     '',
@@ -625,16 +652,26 @@ function buildGeminiPrompt_(data, focusApp) {
     '  "headline": "Clear single executive takeaway sentence",',
     '  "observations": ["Observation 1", "Observation 2", "Observation 3"],',
     '  "next_steps": [{"action": "Actionable item description", "pic": "Owner/Team"}],',
-    '  "speaker_notes": "A detailed, professional presentation script for this slide: walk through the funnel, new vs returning and repeat users, the trend, any data quality warnings, and the reasoning behind each recommendation."',
+    '  "speaker_notes": "A detailed, professional presentation script for this slide: walk through the funnel, new vs returning and repeat users, the trend, the specific days that rose or dropped and what may explain them, any data quality warnings, and the reasoning behind each recommendation."',
     '}',
     '',
     'Rules (the slide has limited space, keep on-slide text short):',
     '- Write in ' + LS_CONFIG.OUTPUT_LANGUAGE + '.',
+    '- Use plain business language. Never write JSON field names (e.g. uniqueUsers, repeatUsers, ctrPct, user-days); say "unique users", "repeat users", "CTR", "daily users".',
     '- Ground every statement in DATA and quote numbers exactly as given; always say which app a number belongs to.',
     '- Never describe summed feature users as unique users; use uniqueUsers for distinct users.',
     '- If dataPeriod.days < 7, state that trends are preliminary.',
     '- If dataQualityIssues is not empty, mention the most important one in an observation.',
-    '- Recommendations must fit the product context (e.g. link Lapak Sawit to Panen Emas, Protim or Laporan TBS moments where relevant).',
+    '',
+    'ACTION PLAN RULES (next_steps):',
+    '- Every action must be about the ' + data.feature + ' feature itself: getting more users to open it, getting them to come back, or understanding why usage moved.',
+    '- Good action types: a ' + data.feature + ' campaign or promo, ads, push notification / WhatsApp blast, in-app banner or reminder for ' + data.feature + ', ' +
+      'improving the ' + data.feature + ' flow or content, following up a user segment (new users who never came back, repeat users), ' +
+      'or investigating a specific date that spiked or dropped.',
+    '- Do NOT recommend integrating, linking or bundling ' + data.feature + ' with other features (Panen Emas, Protim, Laporan TBS, DO, affiliate, etc.), and do not recommend changes to other features.',
+    '- At least one action must name a specific date from summary.notableDays (or bestDay / worstDay) and say what to check ' +
+      '(e.g. a campaign or broadcast sent that day, FFB price or supply changes, listings available, app release or bug, holiday or harvest day).',
+    '- Each action must follow from a number in DATA; mention that number briefly when it fits.',
     '- headline: one sentence, max 20 words.',
     '- observations: exactly 3 items, each max 24 words, no leading bullet characters.',
     '- next_steps: exactly 3 items; "action" max 16 words; "pic" is a short team name (max 4 words).',
