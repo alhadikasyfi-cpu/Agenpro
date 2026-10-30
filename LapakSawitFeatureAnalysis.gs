@@ -33,7 +33,9 @@ const LS_CONFIG = {
     newUsers: ['new_users', 'new_user'],
     returningUsers: ['returning_users', 'returning_user', 'return_users'],
     penetration: ['penetration_rate_pct', 'penetration_pct'],
-    userNames: ['user_names', 'usernames', 'names']
+    userNames: ['user_names', 'usernames', 'names'],
+    // App weekly active users (rolling 7 days ending on that date). The value on a week's last day is that week's WAU.
+    appWau: ['weekly_active_users', 'app_wau', 'wau']
   },
   // Fallback for per-feature user columns such as "feature_lapaksawit_users"
   FEATURE_USERS_PATTERN: /^feature_.+_users$/,
@@ -299,7 +301,8 @@ function readFeatureSheet_(ss) {
       newUsers: optionalNumber(row, 'newUsers'),
       returningUsers: optionalNumber(row, 'returningUsers'),
       penetration: optionalNumber(row, 'penetration'),
-      names: col.userNames >= 0 ? parseNames_(row[col.userNames]) : null
+      names: col.userNames >= 0 ? parseNames_(row[col.userNames]) : null,
+      appWau: optionalNumber(row, 'appWau')
     });
   }
   if (!rows.length) throw new Error('Sheet "' + sheetName + '" has no data before the first empty row.');
@@ -411,6 +414,8 @@ function buildAnalysisInput_(sheet) {
 /* ------------------------------ WEEKLY METRICS ------------------------------ */
 
 const WEEK_METRICS = [
+  { key: 'appWau', label: 'App WAU', kind: 'count' },
+  { key: 'conversionPct', label: 'App WAU → feature conversion', kind: 'pct' },
   { key: 'avgDau', label: 'App DAU (avg per day)', kind: 'count' },
   { key: 'wau', label: 'WAU · users who opened it', kind: 'count' },
   { key: 'visits', label: 'Visits (daily users, summed)', kind: 'count' },
@@ -455,6 +460,7 @@ function buildWeekly_(apps, dates, hasNames, issues) {
       totalDau: parts.reduce((acc, p) => acc + p.totalDau, 0),
       visits: parts.reduce((acc, p) => acc + p.visits, 0),
       newFromSheet: parts.every(p => p.newFromSheet != null) ? parts.reduce((acc, p) => acc + p.newFromSheet, 0) : null,
+      appWau: parts.every(p => p.appWau != null) ? parts.reduce((acc, p) => acc + p.appWau, 0) : null,
       nameDays: nameDays
     };
   });
@@ -504,6 +510,7 @@ function weekRaw_(full, win) {
     totalDau: rows.reduce((acc, r) => acc + r.dau, 0),
     visits: rows.reduce((acc, r) => acc + r.featureUsers, 0),
     newFromSheet: rows.length && rows.every(r => r.newUsers != null) ? rows.reduce((acc, r) => acc + r.newUsers, 0) : null,
+    appWau: rows.filter(r => r.appWau != null).map(r => r.appWau).pop() || null,
     nameDays: nameDays
   };
 }
@@ -532,7 +539,9 @@ function buildWeekSeries_(raws, hasNames, seenBefore) {
       totalDau: raw.totalDau,
       visits: raw.visits,
       ctrPct: raw.totalDau > 0 ? round2_((raw.visits / raw.totalDau) * 100) : null,
+      appWau: raw.appWau,
       wau: wau,
+      conversionPct: raw.appWau && wau != null ? round2_((wau / raw.appWau) * 100) : null,
       newUsers: newUsers,
       returningUsers: returning,
       prevWau: prevWau,
@@ -582,7 +591,7 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
     if (r.names && r.names.length && r.names.length !== r.featureUsers) {
       issues.push(tag + key + ': ' + r.names.length + ' user names vs ' + r.featureUsers + ' feature users');
     }
-    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: ctr, names: r.names || [] };
+    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: ctr, names: r.names || [], appWau: r.appWau };
   });
 
   const full = Object.keys(byDate).sort().map(k => byDate[k]);
@@ -934,6 +943,8 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     feature: data.feature,
     weekDefinition: 'Weeks are rolling 7-day blocks ending on the latest date in the data (this week = the last 7 days).',
     metricDefinitions: {
+      appWau: 'app weekly active users (null when the sheet has no WAU column; then use ctrPct as the conversion)',
+      conversionPct: 'WAU → click conversion = users who opened ' + data.feature + ' ÷ app WAU',
       wau: 'distinct users who opened ' + data.feature + ' during the week',
       visits: 'daily feature users summed over the week (one user on 3 days = 3 visits)',
       ctrPct: 'visits ÷ app DAU summed over the week',
@@ -951,14 +962,15 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     ? Object.assign(base, {
       focusApp: Object.assign({ description: focusApp.appDescription }, appWeekly(focusApp)),
       benchmarkOtherAppsThisWeek: data.apps.filter(a => a !== focusApp).map(a => ({
-        app: a.app, wau: a.weekCompare.current.wau, ctrPct: a.weekCompare.current.ctrPct, newUsers: a.weekCompare.current.newUsers, retentionPct: a.weekCompare.current.retentionPct
+        app: a.app, wau: a.weekCompare.current.wau, conversionPct: a.weekCompare.current.conversionPct, ctrPct: a.weekCompare.current.ctrPct, newUsers: a.weekCompare.current.newUsers, retentionPct: a.weekCompare.current.retentionPct
       }))
     })
     : Object.assign(base, { allAppsCombined: { weeks: data.weekly.combined, thisWeekVsLastWeek: data.weekly.combinedCompare }, apps: data.apps.map(appWeekly) });
 
   const scope = focusApp ? [
     'SLIDE SCOPE: weekly review of ' + data.feature + ' in ' + focusApp.app + ' ONLY: this week vs last week.',
-    'Explain what changed week over week: WAU, CTR, new users, returning users, retention and churn. Use benchmarkOtherAppsThisWeek only as a brief comparison.'
+    'Explain the weekly funnel (app WAU → users who clicked ' + data.feature + ' → returning users) and what changed week over week: ' +
+      'conversion or CTR, new users, returning users, retention and churn. Use benchmarkOtherAppsThisWeek only as a brief comparison.'
   ] : [
     'SLIDE SCOPE: weekly review of ' + data.feature + ' across all apps (' + data.apps.map(a => a.app).join(' vs ') + '): this week vs last week.',
     'Explain the combined week-over-week change and which app drove it.'
@@ -1119,95 +1131,121 @@ function drawKpiCard_(slide, x, y, w, h, card) {
  * DAU → feature funnel, one block per app. Each block: DAU bar (full track) and feature-user bar drawn to the
  * same scale, CTR with trend vs the prior window, and unique / repeat users for the period.
  */
-function drawFunnel_(slide, data, box) {
+/** Summary funnel rows per app for the day-level slide: average DAU → clicks per day over the period. */
+function dailyFunnelRows_(data) {
   const C = LS_CONFIG.COLORS;
-  const apps = data.apps;
+  const trendLabel = data.apps[0].summary.trend ? data.apps[0].summary.trend.label : 'prior period';
+  return {
+    title: 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase(),
+    subtitle: 'Average per day · ' + data.dataPeriod.days + ' days',
+    stepHeader: 'FUNNEL STEP (AVG / DAY)',
+    convHeader: 'CTR',
+    rightHeader: 'UNIQUE USERS',
+    rows: data.apps.map(a => {
+      const s = a.summary;
+      const parts = [{ text: fmtNum_(s.avgFeatureUsers, 1), bold: true, color: C.ink }];
+      if (s.avgNewUsers != null) {
+        parts.push(
+          { text: '   new ', color: C.muted }, { text: fmtNum_(s.avgNewUsers, 1), bold: true, color: C.ink },
+          { text: '  ·  returning ', color: C.muted }, { text: fmtNum_(s.avgReturningUsers, 1), bold: true, color: C.ink },
+          { text: ' (' + fmtPct_(s.returningSharePct, 0) + ')', color: C.muted }
+        );
+      }
+      return {
+        app: a,
+        topLabel: 'DAU',
+        topValue: s.avgDau,
+        clickValue: s.avgFeatureUsers,
+        ratio: (s.ctrPct || 0) / 100,
+        clickParts: parts,
+        conv: s.ctrPct,
+        convPp: s.trend ? s.trend.ctrChangePp : null,
+        rightValue: s.uniqueUsers == null ? '–' : fmtNum_(s.uniqueUsers),
+        rightSub: s.uniqueUsers == null ? null : fmtNum_(s.repeatUsers) + ' repeat'
+      };
+    }),
+    footnote: 'CTR = users who clicked ÷ DAU  ·  pp = CTR change, ' + trendLabel + '  ·  unique = distinct user_names; repeat = active on ≥2 days'
+  };
+}
+
+/** Funnel per app (one block each): top step bar and click bar on the same scale, conversion with trend, right-hand stat. */
+function drawFunnel_(slide, data, box, view) {
+  const C = LS_CONFIG.COLORS;
+  view = view || dailyFunnelRows_(data);
+  const rows = view.rows;
 
   panel_(slide, box);
-  sectionTitle_(slide, 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase(), box.x + 10, box.y + 8, 220);
-  addText_(slide, 'Average per day · ' + data.dataPeriod.days + ' days', box.x + box.w - 160, box.y + 8, 150, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
+  sectionTitle_(slide, view.title, box.x + 10, box.y + 8, 240);
+  addText_(slide, view.subtitle, box.x + box.w - 160, box.y + 8, 150, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
 
   const col = { app: box.x + 10, appW: 46, step: box.x + 62, stepW: 34, track: box.x + 100, ctr: box.x + box.w - 108, ctrW: 50, uniq: box.x + box.w - 56, uniqW: 46 };
   col.trackW = col.ctr - 10 - col.track;
 
   const headY = box.y + 24;
-  [['APP', col.app, col.appW, 'START'], ['FUNNEL STEP (AVG / DAY)', col.step, col.trackW + col.stepW, 'START'],
-    ['CTR', col.ctr, col.ctrW, 'CENTER'], ['UNIQUE USERS', col.uniq, col.uniqW, 'CENTER']]
+  [['APP', col.app, col.appW, 'START'], [view.stepHeader, col.step, col.trackW + col.stepW, 'START'],
+    [view.convHeader, col.ctr, col.ctrW, 'CENTER'], [view.rightHeader, col.uniq, col.uniqW, 'CENTER']]
     .forEach(h => addText_(slide, h[0], h[1], headY, h[2], 7, { fontSize: 5.5, bold: true, color: C.muted, align: h[3] }));
   hLine_(slide, box.x + 10, box.x + box.w - 10, headY + 9, C.border, 0.5);
 
   const top = box.y + 37, bottom = box.y + box.h - 15;
-  const blockH = Math.min(46, (bottom - top) / apps.length);
+  const blockH = Math.min(46, (bottom - top) / rows.length);
   const rowH = Math.min(16, (blockH - 6) / 2);
 
-  apps.forEach((a, i) => {
-    const s = a.summary;
+  rows.forEach((r, i) => {
+    const a = r.app;
     const y0 = top + i * blockH;
     const rowA = y0, rowB = y0 + rowH + 2;
     if (i > 0) hLine_(slide, box.x + 10, box.x + box.w - 10, y0 - 2.5, C.grid, 0.5);
 
-    // App chip
     pill_(slide, a.app, col.app, y0 + rowH + 1 - 7, col.appW, 14, a.color, C.white, 6.5);
 
-    // Step 1: DAU (full track)
-    addText_(slide, 'DAU', col.step, rowA, col.stepW, rowH, { fontSize: 6, color: C.muted, bold: true, valign: 'MIDDLE' });
+    // Step 1: full track
+    addText_(slide, r.topLabel, col.step, rowA, col.stepW, rowH, { fontSize: 6, color: C.muted, bold: true, valign: 'MIDDLE' });
     rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowA + rowH / 2 - 6, col.trackW, 12, a.soft);
-    addText_(slide, fmtNum_(s.avgDau), col.track, rowA, col.trackW - 6, rowH, { fontSize: 7, bold: true, color: a.color, align: 'END', valign: 'MIDDLE' });
+    addText_(slide, fmtNum_(r.topValue), col.track, rowA, col.trackW - 6, rowH, { fontSize: 7, bold: true, color: a.color, align: 'END', valign: 'MIDDLE' });
 
-    // Step 2: feature users, same scale as DAU
+    // Step 2: clicks, same scale as step 1
     addText_(slide, 'Klik', col.step, rowB, col.stepW, rowH, { fontSize: 6, color: C.ink, bold: true, valign: 'MIDDLE' });
     rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowB + rowH / 2 - 6, col.trackW, 12, C.track);
-    const fillW = s.avgFeatureUsers > 0 ? Math.max(4, col.trackW * (s.ctrPct || 0) / 100) : 0;
+    const fillW = r.clickValue > 0 ? Math.max(4, col.trackW * Math.min(1, r.ratio)) : 0;
     if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, rowB + rowH / 2 - 6, fillW, 12, a.color);
-    const parts = [{ text: fmtNum_(s.avgFeatureUsers, 1), bold: true, color: C.ink }];
-    if (s.avgNewUsers != null) {
-      parts.push(
-        { text: '   new ', color: C.muted }, { text: fmtNum_(s.avgNewUsers, 1), bold: true, color: C.ink },
-        { text: '  ·  returning ', color: C.muted }, { text: fmtNum_(s.avgReturningUsers, 1), bold: true, color: C.ink },
-        { text: ' (' + fmtPct_(s.returningSharePct, 0) + ')', color: C.muted }
-      );
-    }
     const ox = col.track + fillW + 5;
-    addRichText_(slide, parts, ox, rowB, col.track + col.trackW - ox, rowH, { fontSize: 6, valign: 'MIDDLE' });
+    addRichText_(slide, r.clickParts, ox, rowB, col.track + col.trackW - ox, rowH, { fontSize: 6, valign: 'MIDDLE' });
 
-    // CTR + trend
-    addText_(slide, fmtPct_(s.ctrPct, 2), col.ctr, rowA, col.ctrW, rowH, { fontSize: 11, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
-    const t = s.trend;
-    if (t && t.ctrChangePp != null) {
-      const pp = t.ctrChangePp, up = pp > 0, flat = pp === 0;
+    // Conversion + trend
+    addText_(slide, fmtPct_(r.conv, 2), col.ctr, rowA, col.ctrW, rowH, { fontSize: 11, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
+    if (r.convPp != null) {
+      const pp = r.convPp, up = pp > 0, flat = pp === 0;
       pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', col.ctr + 2, rowB + rowH / 2 - 5.5, col.ctrW - 4, 11,
         flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 5.5);
     }
 
-    // Unique / repeat users
-    addText_(slide, s.uniqueUsers == null ? '–' : fmtNum_(s.uniqueUsers), col.uniq, rowA, col.uniqW, rowH, { fontSize: 11, bold: true, color: C.ink, align: 'CENTER', valign: 'MIDDLE' });
-    if (s.uniqueUsers != null) {
-      addText_(slide, fmtNum_(s.repeatUsers) + ' repeat', col.uniq, rowB, col.uniqW, rowH, { fontSize: 5.5, color: C.muted, align: 'CENTER', valign: 'MIDDLE' });
-    }
+    // Right-hand stat
+    addText_(slide, r.rightValue, col.uniq, rowA, col.uniqW, rowH, { fontSize: 11, bold: true, color: C.ink, align: 'CENTER', valign: 'MIDDLE' });
+    if (r.rightSub) addText_(slide, r.rightSub, col.uniq, rowB, col.uniqW, rowH, { fontSize: 5.5, color: C.muted, align: 'CENTER', valign: 'MIDDLE' });
   });
 
-  const trendLabel = apps[0].summary.trend ? apps[0].summary.trend.label : 'prior period';
-  addText_(slide, 'CTR = users who clicked ÷ DAU  ·  pp = CTR change, ' + trendLabel + '  ·  unique = distinct user_names; repeat = active on ≥2 days',
-    box.x + 10, box.y + box.h - 11, box.w - 20, 7, { fontSize: 5, color: C.muted });
+  addText_(slide, view.footnote, box.x + 10, box.y + box.h - 11, box.w - 20, 7, { fontSize: 5, color: C.muted });
 }
 
 /** Daily CTR per app; point labels when the range is short enough to read them. */
-function drawDailyChart_(slide, data, box) {
+function drawDailyChart_(slide, data, box, range) {
   const C = LS_CONFIG.COLORS;
   const apps = data.apps;
   const dates = [];
-  apps.forEach(a => a.dailySeries.forEach(r => dates.indexOf(r.date) < 0 && dates.push(r.date)));
+  apps.forEach(a => a.dailySeries.forEach(r => (!range || r.date >= range.from) && dates.indexOf(r.date) < 0 && dates.push(r.date)));
   dates.sort();
   const n = dates.length;
   const detailed = n <= 14;
 
   panel_(slide, box);
   sectionTitle_(slide, 'DAILY CTR BY APP', box.x + 10, box.y + 8, 120);
+  if (range) drawWeekDivider_(slide, dates.slice().sort(), range, box, 16);
 
   // Legend, right-aligned on the title row
   let lx = box.x + box.w - 10;
   apps.slice().reverse().forEach(a => {
-    const label = a.app + '  (avg ' + fmtPct_(a.summary.ctrPct, 2) + ')';
+    const label = range ? a.app : a.app + '  (avg ' + fmtPct_(a.summary.ctrPct, 2) + ')';
     const tw = estimateTextWidth_(label, 6);
     lx -= tw;
     addText_(slide, label, lx, box.y + 8, tw, 11, { fontSize: 6, color: C.ink, valign: 'MIDDLE' });
@@ -1236,6 +1274,7 @@ function drawDailyChart_(slide, data, box) {
   const points = apps.map(a => {
     const byDate = {};
     a.dailySeries.forEach(r => byDate[r.date] = r.ctrPct);
+    if (range) Object.keys(byDate).forEach(d => d < range.from && delete byDate[d]);
     return dates.map(d => (byDate[d] == null ? null : byDate[d]));
   });
   apps.forEach((a, ai) => {
@@ -1259,7 +1298,7 @@ function drawDailyChart_(slide, data, box) {
   });
 
   // X-axis dates, thinned out for long ranges
-  const every = Math.ceil(n / 8);
+  const every = n <= 14 ? 1 : Math.ceil(n / 8);
   const labelIdx = [];
   for (let i = 0; i < n; i += every) labelIdx.push(i);
   if (labelIdx[labelIdx.length - 1] !== n - 1) {
@@ -1303,23 +1342,11 @@ function drawAppKpiCards_(slide, data, app, box) {
   cards.forEach((card, i) => drawKpiCard_(slide, box.x + i * (w + gap), box.y, w, box.h, card));
 }
 
-/**
- * Single-app funnel: DAU → clicked the feature → came back (returning), all on one scale,
- * with drop-off notes between steps and a CTR callout on the right.
- */
-function drawAppFunnel_(slide, data, app, box) {
+/** Day-level funnel content for one app: average DAU → clicks → returning, over the whole period. */
+function dailyAppFunnelView_(data, app) {
   const C = LS_CONFIG.COLORS;
   const s = app.summary;
   const hasSplit = s.avgReturningUsers != null;
-
-  panel_(slide, box);
-  sectionTitle_(slide, 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase() + (hasSplit ? ' → KEMBALI' : ''), box.x + 10, box.y + 8, 260);
-
-  const callout = { x: box.x + box.w - 118, y: box.y + 26, w: 108, h: box.h - 34 };
-  const col = { badge: box.x + 10, label: box.x + 28, track: box.x + 110 };
-  col.labelW = col.track - col.label - 6;
-  col.trackW = callout.x - 12 - col.track;
-
   const steps = [
     { name: 'Daily Active Users', value: s.avgDau, ratio: 1, color: app.soft, valueColor: app.color, note: 'avg users/day' },
     { name: 'Klik ' + data.feature, value: s.avgFeatureUsers, ratio: (s.ctrPct || 0) / 100, color: app.color, note: fmtPct_(s.ctrPct, 2) + ' of DAU' }
@@ -1330,6 +1357,127 @@ function drawAppFunnel_(slide, data, app, box) {
       color: C.returning, note: fmtPct_(s.returningSharePct, 0) + ' of clickers were returning'
     });
   }
+  const gaps = [];
+  if (s.ctrPct != null) gaps.push([{ text: '▼ ' + fmtPct_(100 - s.ctrPct, 2), bold: true, color: C.red }, { text: ' of DAU did not open ' + data.feature, color: C.muted }]);
+  if (hasSplit && s.avgFeatureUsers > 0) {
+    gaps.push([
+      { text: fmtNum_(s.avgNewUsers, 1) + ' new', bold: true, color: app.color },
+      { text: ' (' + fmtPct_(100 - s.returningSharePct, 0) + ') per day are first-time users', color: C.muted }
+    ]);
+  }
+  const stats = s.bestDay && s.worstDay ? [
+    { text: 'Best day  ', color: C.muted },
+    { text: formatShortDate_(s.bestDay.date) + ' · ' + fmtPct_(s.bestDay.ctrPct, 2), bold: true, color: C.okInk },
+    { text: '  (' + fmtNum_(s.bestDay.featureUsers) + ' of ' + fmtNum_(s.bestDay.dau) + ')', color: C.muted },
+    { text: '      Lowest  ', color: C.muted },
+    { text: formatShortDate_(s.worstDay.date) + ' · ' + fmtPct_(s.worstDay.ctrPct, 2), bold: true, color: C.red },
+    { text: '  (' + fmtNum_(s.worstDay.featureUsers) + ' of ' + fmtNum_(s.worstDay.dau) + ')', color: C.muted }
+  ] : null;
+  return {
+    title: 'FUNNEL  ·  DAU → KLIK ' + data.feature.toUpperCase() + (hasSplit ? ' → KEMBALI' : ''),
+    subtitle: null,
+    steps: steps,
+    gaps: gaps,
+    stats: stats,
+    callout: {
+      label: 'CLICK-THROUGH RATE',
+      value: s.ctrPct,
+      sub: 'of ' + app.app + ' DAU open ' + data.feature,
+      trendPp: s.trend ? s.trend.ctrChangePp : null,
+      trendLabel: s.trend ? s.trend.label : '',
+      benchmark: data.apps.filter(a => a !== app).map(o => o.app + ' ' + fmtPct_(o.summary.ctrPct, 2)).join(' · ')
+    }
+  };
+}
+
+/**
+ * Week-level funnel content for one app (this week, with last week alongside): app WAU → users who clicked → returning.
+ * Without an app WAU column the first step falls back to average DAU and the conversion to visits ÷ DAU.
+ */
+function weeklyAppFunnelView_(data, app) {
+  const C = LS_CONFIG.COLORS;
+  const cmp = app.weekCompare;
+  const cur = cmp.current, prev = cmp.previous;
+  const hasWau = cur.appWau != null;
+  const top = hasWau ? cur.appWau : cur.avgDau;
+  const conv = hasWau ? cur.conversionPct : cur.ctrPct;
+  const convKey = hasWau ? 'conversionPct' : 'ctrPct';
+  const lastWk = v => (prev ? 'last wk ' + v : null);
+
+  const steps = [
+    {
+      name: hasWau ? 'Weekly Active Users' : 'App DAU (avg/day)',
+      sub: lastWk(fmtNum_(prev && (hasWau ? prev.appWau : prev.avgDau))),
+      value: top, ratio: 1, color: app.soft, valueColor: app.color, note: hasWau ? 'app users this week' : 'app WAU not in sheet'
+    },
+    {
+      name: 'Klik ' + data.feature,
+      sub: lastWk(fmtNum_(prev && prev.wau)),
+      value: cur.wau, ratio: hasWau && top ? cur.wau / top : (cur.ctrPct || 0) / 100, color: app.color,
+      note: hasWau ? fmtPct_(conv, 2) + ' of WAU' : 'users this week · CTR ' + fmtPct_(cur.ctrPct, 2) + ' (visits ÷ DAU)'
+    }
+  ];
+  if (cur.returningUsers != null) {
+    steps.push({
+      name: 'Kembali lagi',
+      sub: lastWk(fmtNum_(prev && prev.returningUsers)),
+      value: cur.returningUsers, ratio: top ? cur.returningUsers / top : 0, color: C.returning,
+      note: fmtPct_(cur.wau ? (cur.returningUsers / cur.wau) * 100 : null, 0) + ' of clickers had used it before'
+    });
+  }
+
+  const gaps = [];
+  if (conv != null) {
+    gaps.push([{ text: '▼ ' + fmtPct_(100 - conv, 2), bold: true, color: C.red },
+      { text: ' of ' + (hasWau ? 'app WAU' : 'DAU') + ' did not open ' + data.feature + ' this week', color: C.muted }]);
+  }
+  if (cur.newUsers != null && cur.wau) {
+    gaps.push([{ text: fmtNum_(cur.newUsers) + ' new', bold: true, color: app.color },
+      { text: ' (' + fmtPct_((cur.newUsers / cur.wau) * 100, 0) + ') opened it for the first time', color: C.muted }]);
+  }
+  const stats = prev && cur.retainedFromPrev != null ? [
+    { text: 'From last week\'s ' + fmtNum_(prev.wau) + ' users:  ', color: C.muted },
+    { text: fmtNum_(cur.retainedFromPrev) + ' came back (' + fmtPct_(cur.retentionPct, 0) + ')', bold: true, color: C.okInk },
+    { text: '   ·   ', color: C.muted },
+    { text: fmtNum_(cur.churnedFromPrev) + ' did not return', bold: true, color: C.red }
+  ] : null;
+
+  return {
+    title: 'WEEKLY FUNNEL  ·  ' + (hasWau ? 'WAU' : 'DAU') + ' → KLIK ' + data.feature.toUpperCase() + ' → KEMBALI',
+    subtitle: 'This week ' + formatRange_(cur.start, cur.end),
+    steps: steps,
+    gaps: gaps,
+    stats: stats,
+    callout: {
+      label: hasWau ? 'WAU → KLIK CONVERSION' : 'CLICK-THROUGH RATE',
+      value: conv,
+      sub: hasWau ? 'of ' + app.app + ' WAU opened ' + data.feature : 'visits ÷ ' + app.app + ' DAU this week',
+      trendPp: cmp.deltas[convKey] ? cmp.deltas[convKey].diff : null,
+      trendLabel: prev ? 'vs last week (' + fmtPct_(prev[convKey], 2) + ')' : '',
+      benchmark: data.apps.filter(a => a !== app).map(o => o.app + ' ' + fmtPct_(o.weekCompare.current[convKey], 2)).join(' · ')
+    }
+  };
+}
+
+/**
+ * Single-app funnel: top step → clicked the feature → came back, all on one scale, with drop-off notes between
+ * steps and a conversion callout on the right. Content comes from dailyAppFunnelView_ / weeklyAppFunnelView_.
+ */
+function drawAppFunnel_(slide, data, app, box, view) {
+  const C = LS_CONFIG.COLORS;
+  view = view || dailyAppFunnelView_(data, app);
+  const steps = view.steps;
+
+  panel_(slide, box);
+  sectionTitle_(slide, view.title, box.x + 10, box.y + 8, 290);
+  if (view.subtitle) {
+    addText_(slide, view.subtitle, box.x + box.w - 120, box.y + 8, 110, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
+  }
+
+  const callout = { x: box.x + box.w - 118, y: box.y + 26, w: 108, h: box.h - 34 };
+  const col = { badge: box.x + 10, label: box.x + 28, track: box.x + 110 };
+  col.labelW = col.track - col.label - 6;
+  col.trackW = callout.x - 12 - col.track;
 
   const rowH = 16, step = steps.length === 3 ? 27 : 36;
   const rowY = i => box.y + 28 + i * step;
@@ -1341,13 +1489,22 @@ function drawAppFunnel_(slide, data, app, box) {
     const y = rowY(i), cy = y + rowH / 2;
     rect_(slide, SlidesApp.ShapeType.ELLIPSE, col.badge, cy - 6, 12, 12, i === 0 ? app.color : st.color, C.white, 1);
     addText_(slide, String(i + 1), col.badge, cy - 6, 12, 12, { fontSize: 6, bold: true, color: C.white, align: 'CENTER', valign: 'MIDDLE' });
-    addText_(slide, st.name, col.label, y, col.labelW, rowH, { fontSize: fitFontSize_([st.name], col.labelW, 9, 7, 6, 0, true), bold: true, color: C.ink, valign: 'MIDDLE' });
+    const nameSize = fitFontSize_([st.name], col.labelW, 9, 7, 6, 0, true);
+    if (st.sub) {
+      addRichText_(slide, [{ text: st.name, bold: true, color: C.ink }, { text: '\n' + st.sub, color: C.muted, bold: false, size: 5.5 }],
+        col.label, y - 2, col.labelW, rowH + 4, { fontSize: nameSize, valign: 'MIDDLE' });
+    } else {
+      addText_(slide, st.name, col.label, y, col.labelW, rowH, { fontSize: nameSize, bold: true, color: C.ink, valign: 'MIDDLE' });
+    }
 
     rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, col.trackW, 12, C.track);
-    const fillW = st.value > 0 ? Math.max(4, col.trackW * st.ratio) : 0;
+    const fillW = st.value > 0 ? Math.max(4, col.trackW * Math.min(1, st.ratio)) : 0;
     if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - 6, fillW, 12, st.color);
     if (fillW >= 40) {
       addText_(slide, fmtNum_(st.value, 1), col.track, y, fillW - 6, rowH, { fontSize: 7, bold: true, color: st.valueColor || C.white, align: 'END', valign: 'MIDDLE' });
+      if (st.note && fillW < col.trackW - 60) {
+        addText_(slide, st.note, col.track + fillW + 5, y, col.trackW - fillW - 5, rowH, { fontSize: 6, color: C.muted, valign: 'MIDDLE' });
+      }
     } else {
       const ox = col.track + fillW + 5;
       addRichText_(slide, [
@@ -1358,61 +1515,44 @@ function drawAppFunnel_(slide, data, app, box) {
   });
 
   // Drop-off notes between steps
-  const gapNote = (i, parts) => addRichText_(slide, parts, col.track, rowY(i) + rowH + 1, col.trackW, step - rowH - 2, { fontSize: 5.5, valign: 'MIDDLE' });
-  if (s.ctrPct != null) {
-    gapNote(0, [{ text: '▼ ' + fmtPct_(100 - s.ctrPct, 2), bold: true, color: C.red }, { text: ' of DAU did not open ' + data.feature, color: C.muted }]);
-  }
-  if (hasSplit && s.avgFeatureUsers > 0) {
-    gapNote(1, [
-      { text: fmtNum_(s.avgNewUsers, 1) + ' new', bold: true, color: app.color },
-      { text: ' (' + fmtPct_(100 - s.returningSharePct, 0) + ') per day are first-time users', color: C.muted }
-    ]);
-  }
+  view.gaps.forEach((parts, i) => {
+    if (i < steps.length - 1) addRichText_(slide, parts, col.track, rowY(i) + rowH + 1, col.trackW, step - rowH - 2, { fontSize: 5.5, valign: 'MIDDLE' });
+  });
 
-  // Best / lowest day
-  if (s.bestDay && s.worstDay) {
+  if (view.stats) {
     const statsY = box.y + box.h - 15;
     hLine_(slide, box.x + 10, callout.x - 12, statsY - 3, C.border, 0.5);
-    addRichText_(slide, [
-      { text: 'Best day  ', color: C.muted },
-      { text: formatShortDate_(s.bestDay.date) + ' · ' + fmtPct_(s.bestDay.ctrPct, 2), bold: true, color: C.okInk },
-      { text: '  (' + fmtNum_(s.bestDay.featureUsers) + ' of ' + fmtNum_(s.bestDay.dau) + ')', color: C.muted },
-      { text: '      Lowest  ', color: C.muted },
-      { text: formatShortDate_(s.worstDay.date) + ' · ' + fmtPct_(s.worstDay.ctrPct, 2), bold: true, color: C.red },
-      { text: '  (' + fmtNum_(s.worstDay.featureUsers) + ' of ' + fmtNum_(s.worstDay.dau) + ')', color: C.muted }
-    ], box.x + 10, statsY, callout.x - 22 - box.x, 10, { fontSize: 6, valign: 'MIDDLE' });
+    addRichText_(slide, view.stats, box.x + 10, statsY, callout.x - 22 - box.x, 10, { fontSize: 6, valign: 'MIDDLE' });
   }
 
-  // CTR callout with benchmark against the other apps
+  // Conversion callout with trend and benchmark against the other apps
+  const c = view.callout;
   rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, callout.x, callout.y, callout.w, callout.h, app.soft);
-  addText_(slide, 'CLICK-THROUGH RATE', callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
-  addText_(slide, fmtPct_(s.ctrPct, 2), callout.x + 6, callout.y + 17, callout.w - 12, 22, { fontSize: 19, bold: true, color: app.color, align: 'CENTER', valign: 'MIDDLE' });
-  addText_(slide, 'of ' + app.app + ' DAU open ' + data.feature, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
-
-  const t = s.trend;
-  if (t && t.ctrChangePp != null) {
-    const pp = t.ctrChangePp, up = pp > 0, flat = pp === 0;
+  addText_(slide, c.label, callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  addText_(slide, fmtPct_(c.value, 2), callout.x + 6, callout.y + 17, callout.w - 12, 22, { fontSize: 19, bold: true, color: app.color, align: 'CENTER', valign: 'MIDDLE' });
+  addText_(slide, c.sub, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+  if (c.trendPp != null) {
+    const pp = c.trendPp, up = pp > 0, flat = pp === 0;
     pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', callout.x + 14, callout.y + 53, callout.w - 28, 12,
       flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 6.5);
-    addText_(slide, t.label, callout.x + 6, callout.y + 67, callout.w - 12, 7, { fontSize: 5, color: C.muted, align: 'CENTER' });
+    addText_(slide, c.trendLabel, callout.x + 6, callout.y + 67, callout.w - 12, 7, { fontSize: 5, color: C.muted, align: 'CENTER' });
   }
-  const others = data.apps.filter(a => a !== app);
-  if (others.length) {
-    addText_(slide, 'vs ' + others.map(o => o.app + ' ' + fmtPct_(o.summary.ctrPct, 2)).join(' · '),
-      callout.x + 6, callout.y + callout.h - 12, callout.w - 12, 7, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  if (c.benchmark) {
+    addText_(slide, 'vs ' + c.benchmark, callout.x + 6, callout.y + callout.h - 12, callout.w - 12, 7, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
   }
 }
 
 /** Single app: feature users as stacked bars (new / returning, right axis), app DAU as a line (left axis). */
-function drawAppDailyChart_(slide, app, box) {
+function drawAppDailyChart_(slide, app, box, range) {
   const C = LS_CONFIG.COLORS;
-  const rows = app.dailySeries;
+  const rows = range ? app.dailySeries.filter(r => r.date >= range.from) : app.dailySeries;
   const n = rows.length;
   const detailed = n <= 14;
   const hasSplit = rows.every(r => r.newUsers != null && r.returningUsers != null);
 
   panel_(slide, box);
   sectionTitle_(slide, 'DAILY TREND · ' + app.app.toUpperCase(), box.x + 10, box.y + 8, 130);
+  if (range) drawWeekDivider_(slide, rows.map(r => r.date), range, box, 34);
 
   const legend = [{ label: 'DAU (left)', color: C.blue, kind: 'line' }];
   if (hasSplit) legend.push({ label: 'New', color: app.color, kind: 'bar' }, { label: 'Returning (right)', color: C.returning, kind: 'bar' });
@@ -1480,7 +1620,7 @@ function drawAppDailyChart_(slide, app, box) {
   }
 
   // X-axis: date (+ CTR when detailed), thinned out for long ranges
-  const every = Math.ceil(n / 8);
+  const every = n <= 14 ? 1 : Math.ceil(n / 8);
   const labelIdx = [];
   for (let i = 0; i < n; i += every) labelIdx.push(i);
   if (labelIdx[labelIdx.length - 1] !== n - 1) {
@@ -1510,8 +1650,8 @@ function drawWeeklySummarySlide_(slide, data, ai) {
   const L = LS_CONFIG.LAYOUT;
   drawTitle_(slide, data, L.title, null, weeklyTitleOpts_(data, null));
   drawWeeklyKpiCards_(slide, data, data.weekly.combinedCompare, 'ALL APPS', L.kpi);
-  drawWeeklyAppsTable_(slide, data, L.funnel);
-  drawWauByWeek_(slide, data, L.chart);
+  drawFunnel_(slide, data, L.funnel, weeklyFunnelRows_(data));
+  drawDailyChart_(slide, data, L.chart, lastTwoWeeks_(data));
   drawObservations_(slide, ai, L.observations);
   drawNextSteps_(slide, ai, L.actions);
 }
@@ -1521,10 +1661,70 @@ function drawWeeklyAppSlide_(slide, data, app, ai) {
   const L = LS_CONFIG.LAYOUT;
   drawTitle_(slide, data, L.title, app, weeklyTitleOpts_(data, app));
   drawWeeklyKpiCards_(slide, data, app.weekCompare, app.app.toUpperCase(), L.kpi);
-  drawWeeklyTable_(slide, data, app, L.funnel);
-  drawWauBridge_(slide, app, L.chart);
+  drawAppFunnel_(slide, data, app, L.funnel, weeklyAppFunnelView_(data, app));
+  drawAppDailyChart_(slide, app, L.chart, lastTwoWeeks_(data));
   drawObservations_(slide, ai, L.observations);
   drawNextSteps_(slide, ai, L.actions);
+}
+
+/** Daily charts on the weekly slides cover last week + this week. */
+function lastTwoWeeks_(data) {
+  const w = data.weekly.windows;
+  const cur = w[w.length - 1], prev = w.length > 1 ? w[w.length - 2] : null;
+  return { from: (prev || cur).start, weekStart: prev ? cur.start : null, prevLabel: prev ? 'Last week' : null, curLabel: 'This week' };
+}
+
+/** Light shading behind this week's days plus "Last week / This week" labels; drawn first so the chart sits on top. */
+function drawWeekDivider_(slide, dates, range, box, rightPad) {
+  const C = LS_CONFIG.COLORS;
+  if (!range.weekStart || !dates.length) return;
+  const n = dates.length;
+  const idx = dates.indexOf(range.weekStart);
+  if (idx <= 0) return;
+  // Same horizontal geometry as the calling chart: plot.x = box.x + 34, bands of equal width
+  const plotX = box.x + 34, plotW = box.w - 34 - rightPad;
+  const band = plotW / n;
+  const x = plotX + idx * band;
+  rect_(slide, SlidesApp.ShapeType.RECTANGLE, x, box.y + 22, plotX + plotW - x, box.h - 26, C.greenSoft);
+  addText_(slide, range.prevLabel, plotX, box.y + 22, x - plotX, 7, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
+  addText_(slide, range.curLabel, x, box.y + 22, plotX + plotW - x, 7, { fontSize: 5.5, bold: true, color: C.greenDark, align: 'CENTER' });
+}
+
+/** Summary funnel rows per app for the weekly slide: app WAU (or avg DAU) → users who clicked this week. */
+function weeklyFunnelRows_(data) {
+  const C = LS_CONFIG.COLORS;
+  const hasWau = data.apps.every(a => a.weekCompare.current.appWau != null);
+  return {
+    title: 'WEEKLY FUNNEL  ·  ' + (hasWau ? 'WAU' : 'DAU') + ' → KLIK ' + data.feature.toUpperCase(),
+    subtitle: 'This week ' + formatRange_(data.weekly.windows[data.weekly.windows.length - 1].start, data.weekly.windows[data.weekly.windows.length - 1].end),
+    stepHeader: 'FUNNEL STEP (THIS WEEK)',
+    convHeader: hasWau ? 'CONVERSION' : 'CTR',
+    rightHeader: 'RETAINED',
+    rows: data.apps.map(a => {
+      const cur = a.weekCompare.current, prev = a.weekCompare.previous;
+      const convKey = hasWau ? 'conversionPct' : 'ctrPct';
+      return {
+        app: a,
+        topLabel: hasWau ? 'WAU' : 'DAU',
+        topValue: hasWau ? cur.appWau : cur.avgDau,
+        clickValue: cur.wau,
+        ratio: hasWau ? (cur.appWau ? cur.wau / cur.appWau : 0) : (cur.ctrPct || 0) / 100,
+        clickParts: [
+          { text: fmtNum_(cur.wau), bold: true, color: C.ink },
+          { text: ' users' + (prev ? ' (last wk ' + fmtNum_(prev.wau) + ')' : '') + '   new ', color: C.muted },
+          { text: fmtNum_(cur.newUsers), bold: true, color: C.ink },
+          { text: '  ·  returning ', color: C.muted },
+          { text: fmtNum_(cur.returningUsers), bold: true, color: C.ink }
+        ],
+        conv: cur[convKey],
+        convPp: a.weekCompare.deltas[convKey] ? a.weekCompare.deltas[convKey].diff : null,
+        rightValue: cur.retainedFromPrev == null ? '–' : fmtNum_(cur.retainedFromPrev),
+        rightSub: prev && cur.retainedFromPrev != null ? 'of ' + fmtNum_(prev.wau) + ' (' + fmtPct_(cur.retentionPct, 0) + ')' : 'first week'
+      };
+    }),
+    footnote: (hasWau ? 'Conversion = users who clicked ÷ app WAU' : 'CTR = visits ÷ DAU (app WAU not in sheet)') +
+      '  ·  pp = change vs last week  ·  retained = last week\'s users who came back this week'
+  };
 }
 
 function fmtMetric_(value, metric) {
@@ -1557,8 +1757,11 @@ function drawWeeklyKpiCards_(slide, data, cmp, scopeLabel, box) {
   const cards = [
     Object.assign({ label: scopeLabel + ' · ' + data.feature.toUpperCase() + ' WAU', value: fmtNum_(cur.wau), accent: C.greenDark },
       sub('wau', fmtNum_(prev && prev.wau))),
-    Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.blue },
-      sub('ctrPct', fmtPct_(prev && prev.ctrPct, 2))),
+    cur.conversionPct != null
+      ? Object.assign({ label: 'CONVERSION · APP WAU → KLIK', value: fmtPct_(cur.conversionPct, 2), accent: C.blue },
+        sub('conversionPct', fmtPct_(prev && prev.conversionPct, 2)))
+      : Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.blue },
+        sub('ctrPct', fmtPct_(prev && prev.ctrPct, 2))),
     Object.assign({ label: 'NEW USERS (FIRST TIME)', value: fmtNum_(cur.newUsers), accent: C.greenBar },
       sub('newUsers', fmtNum_(prev && prev.newUsers))),
     prev ? {
@@ -1572,196 +1775,6 @@ function drawWeeklyKpiCards_(slide, data, cmp, scopeLabel, box) {
   const gap = 8;
   const w = (box.w - gap * (cards.length - 1)) / cards.length;
   cards.forEach((card, i) => drawKpiCard_(slide, box.x + i * (w + gap), box.y, w, box.h, card));
-}
-
-/** Week-over-week table for one app: last week, this week, paired bars and the change. */
-function drawWeeklyTable_(slide, data, app, box) {
-  const C = LS_CONFIG.COLORS;
-  const cmp = app.weekCompare;
-  const cur = cmp.current, prev = cmp.previous;
-
-  panel_(slide, box);
-  sectionTitle_(slide, 'WEEK OVER WEEK', box.x + 10, box.y + 8, 120);
-  addText_(slide, (prev ? 'Last week ' + formatRange_(prev.start, prev.end) + '  ·  ' : '') + 'This week ' + formatRange_(cur.start, cur.end),
-    box.x + box.w - 230, box.y + 8, 220, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
-
-  const col = { label: box.x + 10, labelW: 128, prev: box.x + 140, cur: box.x + 186, numW: 40, bars: box.x + 236, barsW: 92, delta: box.x + box.w - 82, deltaW: 72 };
-  const headY = box.y + 23;
-  [['METRIC', col.label, col.labelW, 'START'], ['LAST WK', col.prev, col.numW, 'END'], ['THIS WK', col.cur, col.numW, 'END'], ['CHANGE', col.delta, col.deltaW, 'CENTER']]
-    .forEach(h => addText_(slide, h[0], h[1], headY, h[2], 7, { fontSize: 5.5, bold: true, color: C.muted, align: h[3] }));
-  hLine_(slide, box.x + 10, box.x + box.w - 10, headY + 9, C.border, 0.5);
-
-  const top = box.y + 35;
-  const rowH = (box.y + box.h - 5 - top) / WEEK_METRICS.length;
-  WEEK_METRICS.forEach((m, i) => {
-    const y = top + i * rowH;
-    if (i % 2 === 1) rect_(slide, SlidesApp.ShapeType.RECTANGLE, box.x + 6, y, box.w - 12, rowH, C.cardBg);
-    const key = m.key === 'wau';
-    addText_(slide, m.label, col.label, y, col.labelW, rowH, { fontSize: 6, bold: key, color: C.ink, valign: 'MIDDLE' });
-    const pv = prev ? prev[m.key] : null, cv = cur[m.key];
-    addText_(slide, fmtMetric_(pv, m), col.prev, y, col.numW, rowH, { fontSize: 6.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
-    addText_(slide, fmtMetric_(cv, m), col.cur, y, col.numW, rowH, { fontSize: 6.5, bold: true, color: app.color, align: 'END', valign: 'MIDDLE' });
-
-    // Paired bars on a per-row scale: last week (grey) above this week (app colour)
-    const max = Math.max(pv || 0, cv || 0);
-    if (max > 0) {
-      const barH = Math.min(3.2, rowH / 2 - 1);
-      if (pv) rect_(slide, SlidesApp.ShapeType.RECTANGLE, col.bars, y + rowH / 2 - barH - 0.4, Math.max(1.5, col.barsW * pv / max), barH, C.prevBar);
-      if (cv) rect_(slide, SlidesApp.ShapeType.RECTANGLE, col.bars, y + rowH / 2 + 0.4, Math.max(1.5, col.barsW * cv / max), barH, app.color);
-    }
-    const st = deltaStyle_(cmp.deltas[m.key], m);
-    pill_(slide, st.text, col.delta, y + 1, col.deltaW, rowH - 2, st.fill, st.ink, 5.5);
-  });
-}
-
-/** Week-over-week for all apps: one column group (last / this / change) per app. */
-function drawWeeklyAppsTable_(slide, data, box) {
-  const C = LS_CONFIG.COLORS;
-  const apps = data.apps;
-
-  panel_(slide, box);
-  sectionTitle_(slide, 'WEEK OVER WEEK BY APP', box.x + 10, box.y + 8, 160);
-
-  const labelW = 112;
-  const groupX = box.x + 10 + labelW + 4;
-  const groupW = (box.x + box.w - 10 - groupX) / apps.length;
-  const sub = { prev: 0.02, cur: 0.30, delta: 0.56 };
-  const numW = groupW * 0.26, deltaW = groupW * 0.42;
-
-  apps.forEach((a, g) => {
-    const gx = groupX + g * groupW;
-    pill_(slide, a.app, gx + 2, box.y + 22, groupW - 4, 11, a.color, C.white, 6);
-    [['LAST', gx + groupW * sub.prev, numW, 'END'], ['THIS', gx + groupW * sub.cur, numW, 'END'], ['CHANGE', gx + groupW * sub.delta, deltaW, 'CENTER']]
-      .forEach(h => addText_(slide, h[0], h[1], box.y + 36, h[2], 6, { fontSize: 5, bold: true, color: C.muted, align: h[3] }));
-  });
-  addText_(slide, 'METRIC', box.x + 10, box.y + 36, labelW, 6, { fontSize: 5, bold: true, color: C.muted });
-  hLine_(slide, box.x + 10, box.x + box.w - 10, box.y + 44, C.border, 0.5);
-
-  const top = box.y + 46;
-  const rowH = (box.y + box.h - 4 - top) / WEEK_METRICS.length;
-  WEEK_METRICS.forEach((m, i) => {
-    const y = top + i * rowH;
-    if (i % 2 === 1) rect_(slide, SlidesApp.ShapeType.RECTANGLE, box.x + 6, y, box.w - 12, rowH, C.cardBg);
-    addText_(slide, m.label, box.x + 10, y, labelW, rowH, { fontSize: 5.5, bold: m.key === 'wau', color: C.ink, valign: 'MIDDLE' });
-    apps.forEach((a, g) => {
-      const gx = groupX + g * groupW;
-      const cmp = a.weekCompare;
-      addText_(slide, fmtMetric_(cmp.previous ? cmp.previous[m.key] : null, m), gx + groupW * sub.prev, y, numW, rowH, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
-      addText_(slide, fmtMetric_(cmp.current[m.key], m), gx + groupW * sub.cur, y, numW, rowH, { fontSize: 6, bold: true, color: a.color, align: 'END', valign: 'MIDDLE' });
-      const st = deltaStyle_(cmp.deltas[m.key], m);
-      pill_(slide, st.text, gx + groupW * sub.delta, y + 0.8, deltaW, rowH - 1.6, st.fill, st.ink, 5);
-    });
-  });
-}
-
-/**
- * WAU bridge: last week's users → who did not return → new users → users back from earlier weeks → this week's users.
- */
-function drawWauBridge_(slide, app, box) {
-  const C = LS_CONFIG.COLORS;
-  const cmp = app.weekCompare;
-  const cur = cmp.current, prev = cmp.previous;
-
-  panel_(slide, box);
-  sectionTitle_(slide, 'WAU BRIDGE · LAST WEEK → THIS WEEK', box.x + 10, box.y + 8, 220);
-  if (!prev || cur.wau == null || cur.retainedFromPrev == null) {
-    addText_(slide, 'A week-over-week bridge needs two full weeks of data with user names.', box.x + 10, box.y + 40, box.w - 20, 20,
-      { fontSize: 7, color: C.muted, align: 'CENTER', valign: 'MIDDLE' });
-    return;
-  }
-  addRichText_(slide, [
-    { text: 'Retention  ', color: C.muted },
-    { text: fmtPct_(cur.retentionPct, 0), bold: true, color: C.ink },
-    { text: '  (' + fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(prev.wau) + ')', color: C.muted }
-  ], box.x + box.w - 150, box.y + 8, 140, 11, { fontSize: 6, align: 'END', valign: 'MIDDLE' });
-
-  const steps = [
-    { label: 'Last week\n' + formatRange_(prev.start, prev.end), from: 0, to: prev.wau, color: C.prevBar, text: fmtNum_(prev.wau) },
-    { label: 'Did not\nreturn', from: cur.retainedFromPrev, to: prev.wau, color: C.red, text: '−' + fmtNum_(cur.churnedFromPrev) },
-    { label: 'Retained', from: 0, to: cur.retainedFromPrev, color: app.soft, border: app.color, ink: app.color, text: fmtNum_(cur.retainedFromPrev) },
-    { label: 'New users', from: cur.retainedFromPrev, to: cur.retainedFromPrev + cur.newUsers, color: app.color, text: '+' + fmtNum_(cur.newUsers) }
-  ];
-  let level = cur.retainedFromPrev + cur.newUsers;
-  if (cur.cameBackFromEarlier) {
-    steps.push({ label: 'Back from\nearlier weeks', from: level, to: level + cur.cameBackFromEarlier, color: C.returning, text: '+' + fmtNum_(cur.cameBackFromEarlier) });
-    level += cur.cameBackFromEarlier;
-  }
-  steps.push({ label: 'This week\n' + formatRange_(cur.start, cur.end), from: 0, to: cur.wau, color: app.color, text: fmtNum_(cur.wau), strong: true });
-
-  const plot = { x: box.x + 20, y: box.y + 34, w: box.w - 40, h: box.h - 34 - 20 };
-  const max = niceMax_(Math.max(1, prev.wau, cur.wau, level));
-  const band = plot.w / steps.length;
-  const barW = Math.min(46, band * 0.5);
-  const yOf = v => plot.y + plot.h - (v / max) * plot.h;
-  hLine_(slide, plot.x, plot.x + plot.w, plot.y + plot.h, C.border, 0.75);
-
-  steps.forEach((st, i) => {
-    const cx = plot.x + (i + 0.5) * band;
-    const top = yOf(Math.max(st.from, st.to)), bottom = yOf(Math.min(st.from, st.to));
-    if (bottom - top >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, cx - barW / 2, top, barW, bottom - top, st.color, st.border, 0.75);
-    addText_(slide, st.text, cx - 25, top - 10, 50, 8, { fontSize: st.strong ? 7.5 : 6.5, bold: true, color: st.ink || (st.color === C.prevBar ? C.muted : st.color), align: 'CENTER', valign: 'MIDDLE' });
-    addText_(slide, st.label, cx - band / 2, plot.y + plot.h + 2, band, 14, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
-    // Dotted connector to the next step's starting level
-    if (i < steps.length - 1) {
-      const level = st.color === C.red ? st.from : st.to;
-      const line = hLine_(slide, cx + barW / 2, cx + band - barW / 2, yOf(level), C.muted, 0.5);
-      line.setDashStyle(SlidesApp.DashStyle.DOT);
-    }
-  });
-}
-
-/** WAU per week for every app: stacked new (solid) + returning (light) bars, grouped by week. */
-function drawWauByWeek_(slide, data, box) {
-  const C = LS_CONFIG.COLORS;
-  const apps = data.apps;
-  const windows = data.weekly.windows;
-  const n = windows.length;
-
-  panel_(slide, box);
-  sectionTitle_(slide, 'WAU BY WEEK', box.x + 10, box.y + 8, 80);
-
-  let lx = box.x + box.w - 10;
-  const legend = apps.map(a => ({ label: a.app, color: a.color })).concat([{ label: 'light = returning', color: null }]);
-  legend.slice().reverse().forEach(item => {
-    const tw = estimateTextWidth_(item.label, 6) + 4;
-    lx -= tw;
-    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: item.color ? C.ink : C.muted, valign: 'MIDDLE' });
-    if (item.color) {
-      lx -= 10;
-      rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, box.y + 10, 7, 7, item.color);
-    }
-    lx -= 10;
-  });
-
-  const plot = { x: box.x + 30, y: box.y + 32, w: box.w - 40, h: box.h - 32 - 16 };
-  const max = niceMax_(Math.max(1, ...apps.map(a => Math.max(...a.weeks.map(w => w.wau || w.visits || 0)))));
-  const yOf = v => plot.y + plot.h - (v / max) * plot.h;
-  [0, 0.5, 1].forEach(fr => {
-    const gy = yOf(max * fr);
-    const line = hLine_(slide, plot.x, plot.x + plot.w, gy, fr === 0 ? C.border : C.grid, fr === 0 ? 0.75 : 0.5);
-    if (fr > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
-    addText_(slide, fmtNum_(max * fr, 1), box.x + 4, gy - 4, plot.x - box.x - 8, 8, { fontSize: 5.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
-  });
-
-  const band = plot.w / n;
-  const barW = Math.min(30, (band * 0.7) / apps.length);
-  windows.forEach((w, wi) => {
-    const groupX = plot.x + wi * band + (band - barW * apps.length) / 2;
-    apps.forEach((a, ai) => {
-      const wk = a.weeks[wi];
-      const total = wk.wau != null ? wk.wau : wk.visits;
-      const x = groupX + ai * barW;
-      const segs = wk.wau != null && wk.newUsers != null ? [[wk.newUsers, a.color], [wk.returningUsers, a.soft]] : [[total, a.color]];
-      let y = plot.y + plot.h;
-      segs.forEach(sg => {
-        const h = (sg[0] / max) * plot.h;
-        if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, x + 1, y - h, barW - 2, h, sg[1], a.color, 0.5);
-        y -= h;
-      });
-      addText_(slide, fmtNum_(total), x - 6, y - 9, barW + 12, 8, { fontSize: 6, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
-    });
-    addText_(slide, formatRange_(w.start, w.end), plot.x + wi * band, plot.y + plot.h + 3, band, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
-  });
 }
 
 function drawObservations_(slide, ai, box) {
@@ -1902,16 +1915,17 @@ function addText_(slide, text, x, y, w, h, opts) {
   return shape;
 }
 
-/** Text box made of styled runs: parts = [{ text, color?, bold? }]. */
+/** Text box made of styled runs: parts = [{ text, color?, bold?, size? }]. */
 function addRichText_(slide, parts, x, y, w, h, opts) {
   const shape = addText_(slide, parts.map(p => p.text).join(''), x, y, w, h, opts);
   let pos = 0;
   parts.forEach(p => {
     const end = pos + p.text.length;
-    if (p.text.length && (p.bold != null || p.color)) {
+    if (p.text.length && (p.bold != null || p.color || p.size)) {
       const style = shape.getText().getRange(pos, end).getTextStyle();
       if (p.bold != null) style.setBold(p.bold);
       if (p.color) style.setForegroundColor(p.color);
+      if (p.size) style.setFontSize(p.size);
     }
     pos = end;
   });
