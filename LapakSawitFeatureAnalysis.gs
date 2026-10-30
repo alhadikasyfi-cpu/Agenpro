@@ -19,8 +19,11 @@ const LS_CONFIG = {
   // Use ['apps'] for per-app slides only.
   SLIDES: ['summary', 'apps'],
   // 'weekly' = this week vs last week (WAU, new / returning / retained users); 'daily' = the day-level deep dive.
-  // Weeks are rolling 7-day blocks ending on the latest date in the sheet; weekly falls back to daily with < 7 days of data.
+  // Weekly falls back to daily with < 7 days of data.
   REPORT_MODE: 'weekly',
+  // First day of the reporting week (0 = Sunday … 4 = Thursday … 6 = Saturday): weeks run Thursday–Wednesday.
+  // Only complete weeks are compared; days of a week still in progress wait for the next run. null = rolling 7 days.
+  WEEK_START_DAY: 4,
   MAX_WEEKS: 8,
   FONT: 'Arial',
 
@@ -34,11 +37,12 @@ const LS_CONFIG = {
     returningUsers: ['returning_users', 'returning_user', 'return_users'],
     penetration: ['penetration_rate_pct', 'penetration_pct'],
     userNames: ['user_names', 'usernames', 'names'],
-    // App weekly active users (rolling 7 days ending on that date). The value on a week's last day is that week's WAU.
-    appWau: ['weekly_active_users', 'app_wau', 'wau']
+    // Weekly active users, filled on the last day of each week (empty or 0 on other days).
+    appWau: ['app_weekly_active_user', 'app_weekly_active_users', 'weekly_active_users', 'app_wau', 'wau'],
+    featureWau: ['feature_weekly_active_user', 'feature_weekly_active_users', 'feature_wau']
   },
   // Fallback for per-feature user columns such as "feature_lapaksawit_users"
-  FEATURE_USERS_PATTERN: /^feature_.+_users$/,
+  FEATURE_USERS_PATTERN: /^feature_(?!weekly).+_users$/,
   REQUIRED_COLUMNS: ['date', 'dau', 'featureUsers'],
 
   // App variants, in display order. `key` is matched against feature_name minus the feature name.
@@ -228,7 +232,9 @@ function generateLapakSawitSlide() {
         issues.push('AI text mentioning other features removed on ' + (specs[i].app ? specs[i].app.app : 'summary') + ' slide (' + ai.removedOffTopic + ' item(s))');
       }
     });
-    const message = specs.length + ' slide(s) generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' +
+    const inProgress = analysisInput.reportMode === 'weekly' && analysisInput.weekly.daysInProgress
+      ? ' ' + analysisInput.weekly.daysInProgress + ' day(s) of the current week are not compared until the week is complete.' : '';
+    const message = specs.length + ' slide(s) generated (' + analysisInput.dataPeriod.days + ' days, ' + analysisInput.apps.length + ' app(s)).' + inProgress +
       (issues.length ? ' Data warnings: ' + issues.join('; ') : '');
     logRun_(ss, issues.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);
 
@@ -302,7 +308,9 @@ function readFeatureSheet_(ss) {
       returningUsers: optionalNumber(row, 'returningUsers'),
       penetration: optionalNumber(row, 'penetration'),
       names: col.userNames >= 0 ? parseNames_(row[col.userNames]) : null,
-      appWau: optionalNumber(row, 'appWau')
+      // 0 means "not filled" for the weekly columns
+      appWau: optionalNumber(row, 'appWau') || null,
+      featureWau: optionalNumber(row, 'featureWau') || null
     });
   }
   if (!rows.length) throw new Error('Sheet "' + sheetName + '" has no data before the first empty row.');
@@ -433,12 +441,18 @@ const WEEK_METRICS = [
  */
 function buildWeekly_(apps, dates, hasNames, issues) {
   const windows = weekWindows_(dates[0], dates[dates.length - 1]);
-  if (!windows.length) return { windows: [], combined: [], combinedCompare: null, daysOutsideFullWeeks: dates.length };
+  if (!windows.length) return { windows: [], combined: [], combinedCompare: null, daysInProgress: 0 };
 
   const appRaws = apps.map(a => {
     const raws = windows.map(w => weekRaw_(a._full, w));
     raws.forEach(r => {
-      if (r.days < 7) issues.push(a.app + ' week ' + formatRange_(r.start, r.end) + ': only ' + r.days + ' of 7 days have data');
+      const wk = a.app + ' week ' + formatRange_(r.start, r.end);
+      if (r.days < 7) issues.push(wk + ': only ' + r.days + ' of 7 days have data');
+      const named = Object.keys(r.nameDays).length;
+      if (hasNames && r.featureWau != null && named !== r.featureWau) {
+        issues.push(wk + ': feature weekly active user ' + r.featureWau + ' vs ' + named + ' distinct user names');
+      }
+      if (r.appWau == null && r.days === 7) issues.push(wk + ': APP weekly active user is empty on the last day of the week');
     });
     a.weeks = buildWeekSeries_(raws, hasNames, namesBefore_(a._full, windows[0].start));
     a.weekCompare = compareWeeks_(a.weeks);
@@ -461,6 +475,9 @@ function buildWeekly_(apps, dates, hasNames, issues) {
       visits: parts.reduce((acc, p) => acc + p.visits, 0),
       newFromSheet: parts.every(p => p.newFromSheet != null) ? parts.reduce((acc, p) => acc + p.newFromSheet, 0) : null,
       appWau: parts.every(p => p.appWau != null) ? parts.reduce((acc, p) => acc + p.appWau, 0) : null,
+      // Users counted once even if they used the feature in more than one app, so no featureWau sum here
+      featureWau: null,
+      crossAppUsers: hasNames ? Object.keys(nameDays).filter(k => parts.filter(p => p.nameDays[k]).length > 1).length : null,
       nameDays: nameDays
     };
   });
@@ -468,13 +485,19 @@ function buildWeekly_(apps, dates, hasNames, issues) {
   apps.forEach(a => Object.assign(before, namesBefore_(a._full, windows[0].start)));
   const combined = buildWeekSeries_(combinedRaws, hasNames, before);
 
-  const lastDate = dates[dates.length - 1];
-  const daysOutside = dates.filter(d => d < windows[0].start || d > lastDate).length;
-  return { windows: windows, combined: combined, combinedCompare: compareWeeks_(combined), daysOutsideFullWeeks: daysOutside };
+  // Days after the last complete week (the current week is still in progress)
+  const daysInProgress = dates.filter(d => d > windows[windows.length - 1].end).length;
+  return { windows: windows, combined: combined, combinedCompare: compareWeeks_(combined), daysInProgress: daysInProgress };
 }
 
+/** Complete weeks, oldest first: Thursday–Wednesday (WEEK_START_DAY) or rolling 7 days ending on the latest date. */
 function weekWindows_(firstKey, lastKey) {
-  const first = parseDate_(firstKey), last = parseDate_(lastKey);
+  const first = parseDate_(firstKey);
+  let last = parseDate_(lastKey);
+  if (LS_CONFIG.WEEK_START_DAY != null) {
+    const endDay = (LS_CONFIG.WEEK_START_DAY + 6) % 7;
+    while (last.getDay() !== endDay) last = addDays_(last, -1); // last complete week ends on this weekday
+  }
   const out = [];
   for (let k = 0; k < LS_CONFIG.MAX_WEEKS; k++) {
     const end = addDays_(last, -7 * k), start = addDays_(end, -6);
@@ -511,6 +534,7 @@ function weekRaw_(full, win) {
     visits: rows.reduce((acc, r) => acc + r.featureUsers, 0),
     newFromSheet: rows.length && rows.every(r => r.newUsers != null) ? rows.reduce((acc, r) => acc + r.newUsers, 0) : null,
     appWau: rows.filter(r => r.appWau != null).map(r => r.appWau).pop() || null,
+    featureWau: rows.filter(r => r.featureWau != null).map(r => r.featureWau).pop() || null,
     nameDays: nameDays
   };
 }
@@ -524,7 +548,7 @@ function buildWeekSeries_(raws, hasNames, seenBefore) {
   return raws.map((raw, i) => {
     const prev = i > 0 ? raws[i - 1] : null;
     const names = hasNames ? Object.keys(raw.nameDays) : null;
-    const clickUsers = names ? names.length : null;
+    const clickUsers = raw.featureWau != null ? raw.featureWau : names ? names.length : null;
     let newUsers = raw.newFromSheet;
     if (newUsers == null && names) newUsers = names.filter(k => !seen[k]).length;
     const prevClickUsers = prev && names ? Object.keys(prev.nameDays).length : null;
@@ -550,7 +574,16 @@ function buildWeekSeries_(raws, hasNames, seenBefore) {
       churnedFromPrev: prevClickUsers != null ? prevClickUsers - retained : null,
       cameBackFromEarlier: returning != null && retained != null ? Math.max(0, returning - retained) : null,
       repeatInWeek: names ? names.filter(k => Object.keys(raw.nameDays[k]).length >= 2).length : null,
-      visitsPerUser: clickUsers ? round1_(raw.visits / clickUsers) : null
+      visitsPerUser: clickUsers ? round1_(raw.visits / clickUsers) : null,
+      // How "sticky" the app and the feature are within the week (average daily users ÷ weekly users)
+      appStickinessPct: raw.appWau && raw.days ? round1_((raw.totalDau / raw.days / raw.appWau) * 100) : null,
+      featureStickinessPct: clickUsers && raw.days ? round1_((raw.visits / raw.days / clickUsers) * 100) : null,
+      activeDaysSplit: names ? {
+        oneDay: names.filter(k => Object.keys(raw.nameDays[k]).length === 1).length,
+        twoDays: names.filter(k => Object.keys(raw.nameDays[k]).length === 2).length,
+        threePlusDays: names.filter(k => Object.keys(raw.nameDays[k]).length >= 3).length
+      } : null,
+      crossAppUsers: raw.crossAppUsers != null ? raw.crossAppUsers : undefined
     };
   });
 }
@@ -591,7 +624,7 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
     if (r.names && r.names.length && r.names.length !== r.featureUsers) {
       issues.push(tag + key + ': ' + r.names.length + ' user names vs ' + r.featureUsers + ' feature users');
     }
-    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: ctr, names: r.names || [], appWau: r.appWau };
+    byDate[key] = { date: key, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: ctr, names: r.names || [], appWau: r.appWau, featureWau: r.featureWau };
   });
 
   const full = Object.keys(byDate).sort().map(k => byDate[k]);
@@ -937,14 +970,21 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     app: a.app,
     weeks: a.weeks,
     thisWeekVsLastWeek: a.weekCompare,
-    dailyLast14Days: a.dailySeries.slice(-14).map(r => ({ date: r.date, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }))
+    dailyLast14Days: a.dailySeries.filter(r => r.date <= data.weekly.windows[data.weekly.windows.length - 1].end).slice(-14).map(r => ({ date: r.date, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }))
   });
   const base = {
     feature: data.feature,
-    weekDefinition: 'Weeks are rolling 7-day blocks ending on the latest date in the data (this week = the last 7 days).',
+    weekDefinition: LS_CONFIG.WEEK_START_DAY != null
+      ? 'Weeks run ' + ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][LS_CONFIG.WEEK_START_DAY] + ' to ' +
+        ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][(LS_CONFIG.WEEK_START_DAY + 6) % 7] + '; "this week" is the latest complete week.'
+      : 'Weeks are rolling 7-day blocks ending on the latest date in the data (this week = the last 7 days).',
     metricDefinitions: {
       appWau: 'app weekly active users (null when the sheet has no WAU column; then use ctrPct as the conversion)',
       conversionPct: 'WAU → click conversion = users who opened ' + data.feature + ' ÷ app WAU',
+      appStickinessPct: 'app average DAU ÷ app WAU: how many days a week app users come back',
+      featureStickinessPct: 'average daily feature users ÷ weekly feature users: how often feature users come back within the week',
+      activeDaysSplit: 'feature users by number of active days in the week (1 day / 2 days / 3+ days)',
+      crossAppUsers: 'users who used the feature in more than one app in the same week (combined view only)',
       clickUsers: 'distinct users who opened ' + data.feature + ' during the week (this is NOT WAU)',
       visits: 'daily feature users summed over the week (one user on 3 days = 3 visits)',
       ctrPct: 'visits ÷ app DAU summed over the week',
@@ -1217,7 +1257,7 @@ function drawFunnel_(slide, data, box, view) {
     addText_(slide, fmtPct_(r.conv, 2), col.ctr, rowA, col.ctrW, rowH, { fontSize: 11, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
     if (r.convPp != null) {
       const pp = r.convPp, up = pp > 0, flat = pp === 0;
-      pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', col.ctr + 2, rowB + rowH / 2 - 5.5, col.ctrW - 4, 11,
+      pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + Math.abs(pp).toFixed(2) + ' pp', col.ctr + 2, rowB + rowH / 2 - 5.5, col.ctrW - 4, 11,
         flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 5.5);
     }
 
@@ -1234,7 +1274,7 @@ function drawDailyChart_(slide, data, box, range) {
   const C = LS_CONFIG.COLORS;
   const apps = data.apps;
   const dates = [];
-  apps.forEach(a => a.dailySeries.forEach(r => (!range || r.date >= range.from) && dates.indexOf(r.date) < 0 && dates.push(r.date)));
+  apps.forEach(a => a.dailySeries.forEach(r => (!range || (r.date >= range.from && r.date <= range.to)) && dates.indexOf(r.date) < 0 && dates.push(r.date)));
   dates.sort();
   const n = dates.length;
   const detailed = n <= 14;
@@ -1275,7 +1315,7 @@ function drawDailyChart_(slide, data, box, range) {
   const points = apps.map(a => {
     const byDate = {};
     a.dailySeries.forEach(r => byDate[r.date] = r.ctrPct);
-    if (range) Object.keys(byDate).forEach(d => d < range.from && delete byDate[d]);
+    if (range) Object.keys(byDate).forEach(d => (d < range.from || d > range.to) && delete byDate[d]);
     return dates.map(d => (byDate[d] == null ? null : byDate[d]));
   });
   apps.forEach((a, ai) => {
@@ -1319,7 +1359,7 @@ function drawAppKpiCards_(slide, data, app, box) {
   let trendSub = 'feature users ÷ DAU', trendColor = null;
   if (t && t.ctrChangePp != null) {
     const pp = t.ctrChangePp;
-    trendSub = (pp > 0 ? '▲ +' : pp < 0 ? '▼ −' : '■ ') + fmtNum_(Math.abs(pp), 2) + ' pp vs previous ' + t.windowDays + ' days';
+    trendSub = (pp > 0 ? '▲ +' : pp < 0 ? '▼ −' : '■ ') + Math.abs(pp).toFixed(2) + ' pp vs previous ' + t.windowDays + ' days';
     trendColor = pp > 0 ? C.okInk : pp < 0 ? C.red : C.muted;
   }
   const cards = [
@@ -1534,7 +1574,7 @@ function drawAppFunnel_(slide, data, app, box, view) {
   addText_(slide, c.sub, callout.x + 6, callout.y + 41, callout.w - 12, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
   if (c.trendPp != null) {
     const pp = c.trendPp, up = pp > 0, flat = pp === 0;
-    pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + fmtNum_(Math.abs(pp), 2) + ' pp', callout.x + 14, callout.y + 53, callout.w - 28, 12,
+    pill_(slide, (flat ? '■ ' : up ? '▲ +' : '▼ −') + Math.abs(pp).toFixed(2) + ' pp', callout.x + 14, callout.y + 53, callout.w - 28, 12,
       flat ? C.cardBg : up ? C.okSoft : C.redSoft, flat ? C.muted : up ? C.okInk : C.red, 6.5);
     addText_(slide, c.trendLabel, callout.x + 6, callout.y + 67, callout.w - 12, 7, { fontSize: 5, color: C.muted, align: 'CENTER' });
   }
@@ -1546,7 +1586,7 @@ function drawAppFunnel_(slide, data, app, box, view) {
 /** Single app: feature users as stacked bars (new / returning, right axis), app DAU as a line (left axis). */
 function drawAppDailyChart_(slide, app, box, range) {
   const C = LS_CONFIG.COLORS;
-  const rows = range ? app.dailySeries.filter(r => r.date >= range.from) : app.dailySeries;
+  const rows = range ? app.dailySeries.filter(r => r.date >= range.from && r.date <= range.to) : app.dailySeries;
   const n = rows.length;
   const detailed = n <= 14;
   const hasSplit = rows.every(r => r.newUsers != null && r.returningUsers != null);
@@ -1672,7 +1712,7 @@ function drawWeeklyAppSlide_(slide, data, app, ai) {
 function lastTwoWeeks_(data) {
   const w = data.weekly.windows;
   const cur = w[w.length - 1], prev = w.length > 1 ? w[w.length - 2] : null;
-  return { from: (prev || cur).start, weekStart: prev ? cur.start : null, prevLabel: prev ? 'Last week' : null, curLabel: 'This week' };
+  return { from: (prev || cur).start, to: cur.end, weekStart: prev ? cur.start : null, prevLabel: prev ? 'Last week' : null, curLabel: 'This week' };
 }
 
 /** Light shading behind this week's days plus "Last week / This week" labels; drawn first so the chart sits on top. */
@@ -1741,7 +1781,7 @@ function deltaStyle_(delta, metric) {
   if (!delta) return { text: 'n/a', ink: C.muted, fill: C.cardBg };
   const d = delta.diff;
   const arrow = d > 0 ? '▲ +' : d < 0 ? '▼ −' : '■ ';
-  let text = arrow + (metric.kind === 'pct' ? fmtNum_(Math.abs(d), 2) + ' pp' : fmtNum_(Math.abs(d), metric.digits || 0));
+  let text = arrow + (metric.kind === 'pct' ? Math.abs(d).toFixed(2) + ' pp' : fmtNum_(Math.abs(d), metric.digits || 0));
   if (metric.kind !== 'pct' && delta.relPct != null && d !== 0) text += ' (' + (delta.relPct > 0 ? '+' : '−') + fmtNum_(Math.abs(delta.relPct), 0) + '%)';
   return d > 0 ? { text: text, ink: C.okInk, fill: C.okSoft } : d < 0 ? { text: text, ink: C.red, fill: C.redSoft } : { text: text, ink: C.muted, fill: C.cardBg };
 }
