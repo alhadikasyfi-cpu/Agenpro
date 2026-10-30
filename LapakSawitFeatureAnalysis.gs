@@ -417,7 +417,7 @@ const WEEK_METRICS = [
   { key: 'appWau', label: 'App WAU', kind: 'count' },
   { key: 'conversionPct', label: 'App WAU → feature conversion', kind: 'pct' },
   { key: 'avgDau', label: 'App DAU (avg per day)', kind: 'count' },
-  { key: 'wau', label: 'WAU · users who opened it', kind: 'count' },
+  { key: 'clickUsers', label: 'Users who clicked the feature (distinct)', kind: 'count' },
   { key: 'visits', label: 'Visits (daily users, summed)', kind: 'count' },
   { key: 'ctrPct', label: 'CTR (visits ÷ DAU)', kind: 'pct' },
   { key: 'newUsers', label: 'New users (first time ever)', kind: 'count' },
@@ -524,12 +524,12 @@ function buildWeekSeries_(raws, hasNames, seenBefore) {
   return raws.map((raw, i) => {
     const prev = i > 0 ? raws[i - 1] : null;
     const names = hasNames ? Object.keys(raw.nameDays) : null;
-    const wau = names ? names.length : null;
+    const clickUsers = names ? names.length : null;
     let newUsers = raw.newFromSheet;
     if (newUsers == null && names) newUsers = names.filter(k => !seen[k]).length;
-    const prevWau = prev && names ? Object.keys(prev.nameDays).length : null;
+    const prevClickUsers = prev && names ? Object.keys(prev.nameDays).length : null;
     const retained = prev && names ? names.filter(k => prev.nameDays[k]).length : null;
-    const returning = wau != null && newUsers != null ? Math.max(0, wau - newUsers) : null;
+    const returning = clickUsers != null && newUsers != null ? Math.max(0, clickUsers - newUsers) : null;
     if (names) names.forEach(k => seen[k] = true);
     return {
       start: raw.start,
@@ -540,17 +540,17 @@ function buildWeekSeries_(raws, hasNames, seenBefore) {
       visits: raw.visits,
       ctrPct: raw.totalDau > 0 ? round2_((raw.visits / raw.totalDau) * 100) : null,
       appWau: raw.appWau,
-      wau: wau,
-      conversionPct: raw.appWau && wau != null ? round2_((wau / raw.appWau) * 100) : null,
+      clickUsers: clickUsers,
+      conversionPct: raw.appWau && clickUsers != null ? round2_((clickUsers / raw.appWau) * 100) : null,
       newUsers: newUsers,
       returningUsers: returning,
-      prevWau: prevWau,
+      prevClickUsers: prevClickUsers,
       retainedFromPrev: retained,
-      retentionPct: prevWau ? round1_((retained / prevWau) * 100) : null,
-      churnedFromPrev: prevWau != null ? prevWau - retained : null,
+      retentionPct: prevClickUsers ? round1_((retained / prevClickUsers) * 100) : null,
+      churnedFromPrev: prevClickUsers != null ? prevClickUsers - retained : null,
       cameBackFromEarlier: returning != null && retained != null ? Math.max(0, returning - retained) : null,
       repeatInWeek: names ? names.filter(k => Object.keys(raw.nameDays[k]).length >= 2).length : null,
-      visitsPerUser: wau ? round1_(raw.visits / wau) : null
+      visitsPerUser: clickUsers ? round1_(raw.visits / clickUsers) : null
     };
   });
 }
@@ -945,7 +945,7 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     metricDefinitions: {
       appWau: 'app weekly active users (null when the sheet has no WAU column; then use ctrPct as the conversion)',
       conversionPct: 'WAU → click conversion = users who opened ' + data.feature + ' ÷ app WAU',
-      wau: 'distinct users who opened ' + data.feature + ' during the week',
+      clickUsers: 'distinct users who opened ' + data.feature + ' during the week (this is NOT WAU)',
       visits: 'daily feature users summed over the week (one user on 3 days = 3 visits)',
       ctrPct: 'visits ÷ app DAU summed over the week',
       newUsers: 'users who opened ' + data.feature + ' for the first time ever during the week',
@@ -962,7 +962,7 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     ? Object.assign(base, {
       focusApp: Object.assign({ description: focusApp.appDescription }, appWeekly(focusApp)),
       benchmarkOtherAppsThisWeek: data.apps.filter(a => a !== focusApp).map(a => ({
-        app: a.app, wau: a.weekCompare.current.wau, conversionPct: a.weekCompare.current.conversionPct, ctrPct: a.weekCompare.current.ctrPct, newUsers: a.weekCompare.current.newUsers, retentionPct: a.weekCompare.current.retentionPct
+        app: a.app, clickUsers: a.weekCompare.current.clickUsers, conversionPct: a.weekCompare.current.conversionPct, ctrPct: a.weekCompare.current.ctrPct, newUsers: a.weekCompare.current.newUsers, retentionPct: a.weekCompare.current.retentionPct
       }))
     })
     : Object.assign(base, { allAppsCombined: { weeks: data.weekly.combined, thisWeekVsLastWeek: data.weekly.combinedCompare }, apps: data.apps.map(appWeekly) });
@@ -998,8 +998,9 @@ function buildWeeklyGeminiPrompt_(data, focusApp) {
     '',
     'Rules (the slide has limited space, keep on-slide text short):',
     '- Write in ' + LS_CONFIG.OUTPUT_LANGUAGE + '.',
-    '- Always compare this week with last week and quote both numbers (e.g. "WAU 15 vs 25 last week").',
-    '- Use plain business language. Never write JSON field names (e.g. retainedFromPrev, ctrPct, wau); say "WAU", "CTR", "retained users", "new users". Write dates like "22 Oct".',
+    '- Always compare this week with last week and quote both numbers (e.g. "15 users clicked vs 25 last week").',
+    '- Use plain business language. Never write JSON field names (e.g. retainedFromPrev, ctrPct, clickUsers); say "CTR", "users who clicked ' + data.feature + '", "retained users", "new users". Write dates like "22 Oct".',
+    '- "WAU" always means the APP\'s weekly active users (appWau). Never call the users who clicked ' + data.feature + ' "WAU". If appWau is null, do not quote any WAU number.',
     '- Ground every statement in DATA and quote numbers exactly as given; always say which app a number belongs to.',
     '- If weeksInData < 3, say that only ' + data.weekly.windows.length + ' week(s) can be compared so trends are early signals.',
     '- If dataQualityIssues is not empty, mention the most important one in an observation.',
@@ -1412,8 +1413,8 @@ function weeklyAppFunnelView_(data, app) {
     },
     {
       name: 'Klik ' + data.feature,
-      sub: lastWk(fmtNum_(prev && prev.wau)),
-      value: cur.wau, ratio: hasWau && top ? cur.wau / top : (cur.ctrPct || 0) / 100, color: app.color,
+      sub: lastWk(fmtNum_(prev && prev.clickUsers)),
+      value: cur.clickUsers, ratio: hasWau && top ? cur.clickUsers / top : (cur.ctrPct || 0) / 100, color: app.color,
       note: hasWau ? fmtPct_(conv, 2) + ' of WAU' : 'users this week · CTR ' + fmtPct_(cur.ctrPct, 2) + ' (visits ÷ DAU)'
     }
   ];
@@ -1422,7 +1423,7 @@ function weeklyAppFunnelView_(data, app) {
       name: 'Kembali lagi',
       sub: lastWk(fmtNum_(prev && prev.returningUsers)),
       value: cur.returningUsers, ratio: top ? cur.returningUsers / top : 0, color: C.returning,
-      note: fmtPct_(cur.wau ? (cur.returningUsers / cur.wau) * 100 : null, 0) + ' of clickers had used it before'
+      note: fmtPct_(cur.clickUsers ? (cur.returningUsers / cur.clickUsers) * 100 : null, 0) + ' of clickers had used it before'
     });
   }
 
@@ -1431,12 +1432,12 @@ function weeklyAppFunnelView_(data, app) {
     gaps.push([{ text: '▼ ' + fmtPct_(100 - conv, 2), bold: true, color: C.red },
       { text: ' of ' + (hasWau ? 'app WAU' : 'DAU') + ' did not open ' + data.feature + ' this week', color: C.muted }]);
   }
-  if (cur.newUsers != null && cur.wau) {
+  if (cur.newUsers != null && cur.clickUsers) {
     gaps.push([{ text: fmtNum_(cur.newUsers) + ' new', bold: true, color: app.color },
-      { text: ' (' + fmtPct_((cur.newUsers / cur.wau) * 100, 0) + ') opened it for the first time', color: C.muted }]);
+      { text: ' (' + fmtPct_((cur.newUsers / cur.clickUsers) * 100, 0) + ') opened it for the first time', color: C.muted }]);
   }
   const stats = prev && cur.retainedFromPrev != null ? [
-    { text: 'From last week\'s ' + fmtNum_(prev.wau) + ' users:  ', color: C.muted },
+    { text: 'From last week\'s ' + fmtNum_(prev.clickUsers) + ' users:  ', color: C.muted },
     { text: fmtNum_(cur.retainedFromPrev) + ' came back (' + fmtPct_(cur.retentionPct, 0) + ')', bold: true, color: C.okInk },
     { text: '   ·   ', color: C.muted },
     { text: fmtNum_(cur.churnedFromPrev) + ' did not return', bold: true, color: C.red }
@@ -1707,11 +1708,11 @@ function weeklyFunnelRows_(data) {
         app: a,
         topLabel: hasWau ? 'WAU' : 'DAU',
         topValue: hasWau ? cur.appWau : cur.avgDau,
-        clickValue: cur.wau,
-        ratio: hasWau ? (cur.appWau ? cur.wau / cur.appWau : 0) : (cur.ctrPct || 0) / 100,
+        clickValue: cur.clickUsers,
+        ratio: hasWau ? (cur.appWau ? cur.clickUsers / cur.appWau : 0) : (cur.ctrPct || 0) / 100,
         clickParts: [
-          { text: fmtNum_(cur.wau), bold: true, color: C.ink },
-          { text: ' users' + (prev ? ' (last wk ' + fmtNum_(prev.wau) + ')' : '') + '   new ', color: C.muted },
+          { text: fmtNum_(cur.clickUsers), bold: true, color: C.ink },
+          { text: ' users' + (prev ? ' (last wk ' + fmtNum_(prev.clickUsers) + ')' : '') + '   new ', color: C.muted },
           { text: fmtNum_(cur.newUsers), bold: true, color: C.ink },
           { text: '  ·  returning ', color: C.muted },
           { text: fmtNum_(cur.returningUsers), bold: true, color: C.ink }
@@ -1719,7 +1720,7 @@ function weeklyFunnelRows_(data) {
         conv: cur[convKey],
         convPp: a.weekCompare.deltas[convKey] ? a.weekCompare.deltas[convKey].diff : null,
         rightValue: cur.retainedFromPrev == null ? '–' : fmtNum_(cur.retainedFromPrev),
-        rightSub: prev && cur.retainedFromPrev != null ? 'of ' + fmtNum_(prev.wau) + ' (' + fmtPct_(cur.retentionPct, 0) + ')' : 'first week'
+        rightSub: prev && cur.retainedFromPrev != null ? 'of ' + fmtNum_(prev.clickUsers) + ' (' + fmtPct_(cur.retentionPct, 0) + ')' : 'first week'
       };
     }),
     footnote: (hasWau ? 'Conversion = users who clicked ÷ app WAU' : 'CTR = visits ÷ DAU (app WAU not in sheet)') +
@@ -1754,20 +1755,23 @@ function drawWeeklyKpiCards_(slide, data, cmp, scopeLabel, box) {
     const st = deltaStyle_(cmp.deltas[key], metric(key));
     return { sub: st.text + ' vs ' + prevText + ' last week', subColor: st.ink };
   };
+  const hasWau = cur.appWau != null;
   const cards = [
-    Object.assign({ label: scopeLabel + ' · ' + data.feature.toUpperCase() + ' WAU', value: fmtNum_(cur.wau), accent: C.greenDark },
-      sub('wau', fmtNum_(prev && prev.wau))),
-    cur.conversionPct != null
-      ? Object.assign({ label: 'CONVERSION · APP WAU → KLIK', value: fmtPct_(cur.conversionPct, 2), accent: C.blue },
+    hasWau
+      ? Object.assign({ label: scopeLabel + ' · APP WAU', value: fmtNum_(cur.appWau), accent: C.blue }, sub('appWau', fmtNum_(prev && prev.appWau)))
+      : Object.assign({ label: scopeLabel + ' · APP WAU', value: '–', accent: C.blue },
+        { sub: '⚠ not in sheet · avg DAU ' + fmtNum_(cur.avgDau) + '/day', subColor: C.amber }),
+    Object.assign({ label: 'USERS KLIK ' + data.feature.toUpperCase(), value: fmtNum_(cur.clickUsers), accent: C.greenDark },
+      sub('clickUsers', fmtNum_(prev && prev.clickUsers))),
+    hasWau
+      ? Object.assign({ label: 'CONVERSION · WAU → KLIK', value: fmtPct_(cur.conversionPct, 2), accent: C.greenBar },
         sub('conversionPct', fmtPct_(prev && prev.conversionPct, 2)))
-      : Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.blue },
+      : Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.greenBar },
         sub('ctrPct', fmtPct_(prev && prev.ctrPct, 2))),
-    Object.assign({ label: 'NEW USERS (FIRST TIME)', value: fmtNum_(cur.newUsers), accent: C.greenBar },
-      sub('newUsers', fmtNum_(prev && prev.newUsers))),
     prev ? {
       label: 'RETAINED FROM LAST WEEK',
       value: fmtPct_(cur.retentionPct, 0),
-      sub: fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(cur.prevWau) + ' last-week users came back',
+      sub: fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(cur.prevClickUsers) + ' last-week users came back',
       subColor: null,
       accent: C.returning
     } : { label: 'RETURNING USERS', value: fmtNum_(cur.returningUsers), sub: 'used it before this week', accent: C.returning }
