@@ -18,6 +18,10 @@ const LS_CONFIG = {
   // Slides generated per run, in order: 'summary' = all apps side by side, 'apps' = one detail slide per app.
   // Use ['apps'] for per-app slides only.
   SLIDES: ['summary', 'apps'],
+  // 'weekly' = this week vs last week (WAU, new / returning / retained users); 'daily' = the day-level deep dive.
+  // Weeks are rolling 7-day blocks ending on the latest date in the sheet; weekly falls back to daily with < 7 days of data.
+  REPORT_MODE: 'weekly',
+  MAX_WEEKS: 8,
   FONT: 'Arial',
 
   // Accepted header names per field, after normalising (lower-case, non-alphanumerics → "_").
@@ -86,6 +90,7 @@ const LS_CONFIG = {
     greenMid: '#49663D',
     greenBar: '#6E9A5E',
     returning: '#E0A800',
+    prevBar: '#CBD5E1',
     greenSoft: '#EEF4EA',
     greenMuted: '#C9DCC1',
     yellow: '#FFD400',
@@ -205,8 +210,9 @@ function generateLapakSawitSlide() {
       const newSlide = slides[0].duplicate();
       newSlide.move(1 + i);
 
-      if (spec.app) drawAppSlide_(newSlide, analysisInput, spec.app, aiResults[i]);
-      else drawSummarySlide_(newSlide, analysisInput, aiResults[i]);
+      const weekly = analysisInput.reportMode === 'weekly';
+      if (spec.app) (weekly ? drawWeeklyAppSlide_ : drawAppSlide_)(newSlide, analysisInput, spec.app, aiResults[i]);
+      else (weekly ? drawWeeklySummarySlide_ : drawSummarySlide_)(newSlide, analysisInput, aiResults[i]);
 
       if (aiResults[i].speakerNotes) {
         newSlide.getNotesPage().getSpeakerNotesShape().getText().setText(aiResults[i].speakerNotes);
@@ -372,7 +378,12 @@ function buildAnalysisInput_(sheet) {
     combinedUnique = Object.keys(days).length;
     combinedRepeat = Object.keys(days).filter(k => Object.keys(days[k]).length >= 2).length;
   }
-  apps.forEach(a => delete a._nameDays); // user names stay inside the script; never sent to Gemini
+  const weekly = buildWeekly_(apps, dates, sheet.hasNames, issues);
+  // user names stay inside the script; never sent to Gemini
+  apps.forEach(a => {
+    delete a._nameDays;
+    delete a._full;
+  });
 
   return {
     feature: LS_CONFIG.FEATURE_NAME,
@@ -391,8 +402,160 @@ function buildAnalysisInput_(sheet) {
       repeatUsers: combinedRepeat
     },
     apps: apps,
+    weekly: weekly,
+    reportMode: LS_CONFIG.REPORT_MODE === 'weekly' && weekly.windows.length ? 'weekly' : 'daily',
     dataQualityIssues: issues
   };
+}
+
+/* ------------------------------ WEEKLY METRICS ------------------------------ */
+
+const WEEK_METRICS = [
+  { key: 'avgDau', label: 'App DAU (avg per day)', kind: 'count' },
+  { key: 'wau', label: 'WAU · users who opened it', kind: 'count' },
+  { key: 'visits', label: 'Visits (daily users, summed)', kind: 'count' },
+  { key: 'ctrPct', label: 'CTR (visits ÷ DAU)', kind: 'pct' },
+  { key: 'newUsers', label: 'New users (first time ever)', kind: 'count' },
+  { key: 'returningUsers', label: 'Returning users', kind: 'count' },
+  { key: 'retainedFromPrev', label: 'Retained from previous week', kind: 'count' },
+  { key: 'repeatInWeek', label: 'Active on ≥2 days in the week', kind: 'count' },
+  { key: 'visitsPerUser', label: 'Visits per user', kind: 'count', digits: 1 }
+];
+
+/**
+ * Rolling 7-day weeks ending on the latest date (oldest first). Days before the first full week are not used.
+ * Adds app.weeks / app.weekCompare and returns the combined (all apps) weekly view.
+ */
+function buildWeekly_(apps, dates, hasNames, issues) {
+  const windows = weekWindows_(dates[0], dates[dates.length - 1]);
+  if (!windows.length) return { windows: [], combined: [], combinedCompare: null, daysOutsideFullWeeks: dates.length };
+
+  const appRaws = apps.map(a => {
+    const raws = windows.map(w => weekRaw_(a._full, w));
+    raws.forEach(r => {
+      if (r.days < 7) issues.push(a.app + ' week ' + formatRange_(r.start, r.end) + ': only ' + r.days + ' of 7 days have data');
+    });
+    a.weeks = buildWeekSeries_(raws, hasNames, namesBefore_(a._full, windows[0].start));
+    a.weekCompare = compareWeeks_(a.weeks);
+    return raws;
+  });
+
+  // All apps together: totals add up, users are de-duplicated by name across apps
+  const combinedRaws = windows.map((w, i) => {
+    const parts = appRaws.map(raws => raws[i]);
+    const nameDays = {};
+    parts.forEach(p => Object.keys(p.nameDays).forEach(k => {
+      nameDays[k] = nameDays[k] || {};
+      Object.keys(p.nameDays[k]).forEach(d => nameDays[k][d] = true);
+    }));
+    return {
+      start: w.start,
+      end: w.end,
+      days: Math.max(...parts.map(p => p.days)),
+      totalDau: parts.reduce((acc, p) => acc + p.totalDau, 0),
+      visits: parts.reduce((acc, p) => acc + p.visits, 0),
+      newFromSheet: parts.every(p => p.newFromSheet != null) ? parts.reduce((acc, p) => acc + p.newFromSheet, 0) : null,
+      nameDays: nameDays
+    };
+  });
+  const before = {};
+  apps.forEach(a => Object.assign(before, namesBefore_(a._full, windows[0].start)));
+  const combined = buildWeekSeries_(combinedRaws, hasNames, before);
+
+  const lastDate = dates[dates.length - 1];
+  const daysOutside = dates.filter(d => d < windows[0].start || d > lastDate).length;
+  return { windows: windows, combined: combined, combinedCompare: compareWeeks_(combined), daysOutsideFullWeeks: daysOutside };
+}
+
+function weekWindows_(firstKey, lastKey) {
+  const first = parseDate_(firstKey), last = parseDate_(lastKey);
+  const out = [];
+  for (let k = 0; k < LS_CONFIG.MAX_WEEKS; k++) {
+    const end = addDays_(last, -7 * k), start = addDays_(end, -6);
+    if (start.getTime() < first.getTime()) break;
+    out.unshift({ start: dateKey_(start), end: dateKey_(end) });
+  }
+  return out;
+}
+
+function addDays_(d, n) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+}
+
+function namesBefore_(full, startKey) {
+  const seen = {};
+  full.filter(r => r.date < startKey).forEach(r => r.names.forEach(n => seen[nameKey_(n)] = true));
+  return seen;
+}
+
+/** Raw totals and name → active dates for one week of one app. */
+function weekRaw_(full, win) {
+  const rows = full.filter(r => r.date >= win.start && r.date <= win.end);
+  const nameDays = {};
+  rows.forEach(r => r.names.forEach(n => {
+    const k = nameKey_(n);
+    nameDays[k] = nameDays[k] || {};
+    nameDays[k][r.date] = true;
+  }));
+  return {
+    start: win.start,
+    end: win.end,
+    days: rows.length,
+    totalDau: rows.reduce((acc, r) => acc + r.dau, 0),
+    visits: rows.reduce((acc, r) => acc + r.featureUsers, 0),
+    newFromSheet: rows.length && rows.every(r => r.newUsers != null) ? rows.reduce((acc, r) => acc + r.newUsers, 0) : null,
+    nameDays: nameDays
+  };
+}
+
+/**
+ * Weekly metrics, oldest week first. New users come from the sheet's New_users column (first time ever) when present,
+ * otherwise from names not seen in any earlier week.
+ */
+function buildWeekSeries_(raws, hasNames, seenBefore) {
+  const seen = Object.assign({}, seenBefore);
+  return raws.map((raw, i) => {
+    const prev = i > 0 ? raws[i - 1] : null;
+    const names = hasNames ? Object.keys(raw.nameDays) : null;
+    const wau = names ? names.length : null;
+    let newUsers = raw.newFromSheet;
+    if (newUsers == null && names) newUsers = names.filter(k => !seen[k]).length;
+    const prevWau = prev && names ? Object.keys(prev.nameDays).length : null;
+    const retained = prev && names ? names.filter(k => prev.nameDays[k]).length : null;
+    const returning = wau != null && newUsers != null ? Math.max(0, wau - newUsers) : null;
+    if (names) names.forEach(k => seen[k] = true);
+    return {
+      start: raw.start,
+      end: raw.end,
+      days: raw.days,
+      avgDau: raw.days ? Math.round(raw.totalDau / raw.days) : null,
+      totalDau: raw.totalDau,
+      visits: raw.visits,
+      ctrPct: raw.totalDau > 0 ? round2_((raw.visits / raw.totalDau) * 100) : null,
+      wau: wau,
+      newUsers: newUsers,
+      returningUsers: returning,
+      prevWau: prevWau,
+      retainedFromPrev: retained,
+      retentionPct: prevWau ? round1_((retained / prevWau) * 100) : null,
+      churnedFromPrev: prevWau != null ? prevWau - retained : null,
+      cameBackFromEarlier: returning != null && retained != null ? Math.max(0, returning - retained) : null,
+      repeatInWeek: names ? names.filter(k => Object.keys(raw.nameDays[k]).length >= 2).length : null,
+      visitsPerUser: wau ? round1_(raw.visits / wau) : null
+    };
+  });
+}
+
+/** This week vs last week for every metric: absolute difference (pp for percentages) and relative change. */
+function compareWeeks_(weeks) {
+  if (!weeks.length) return null;
+  const current = weeks[weeks.length - 1], previous = weeks.length > 1 ? weeks[weeks.length - 2] : null;
+  const deltas = {};
+  WEEK_METRICS.concat([{ key: 'retentionPct', kind: 'pct' }]).forEach(m => {
+    const a = current[m.key], b = previous ? previous[m.key] : null;
+    deltas[m.key] = a == null || b == null ? null : { diff: round2_(a - b), relPct: m.kind === 'pct' ? null : pctChange_(a, b) };
+  });
+  return { current: current, previous: previous, deltas: deltas };
 }
 
 function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
@@ -482,7 +645,8 @@ function analyzeApp_(featureName, appDef, rows, hasNames, issues) {
     },
     patterns: buildPatterns_(series),
     dailySeries: series,
-    _nameDays: nameDays
+    _nameDays: nameDays,
+    _full: full
   };
 }
 
@@ -662,10 +826,12 @@ function removeOffTopic_(ai, data, focusApp) {
   const feature = data.feature;
   const before = offTopicTexts_(ai, feature).length;
   if (!before) return ai;
-  const scope = focusApp ? focusApp.summary : data.combined;
+  const scope = data.reportMode === 'weekly'
+    ? (focusApp ? focusApp.weekCompare.current : data.weekly.combinedCompare.current)
+    : (focusApp ? focusApp.summary : data.combined);
   return {
     headline: isOffTopic_(ai.headline, feature)
-      ? (focusApp ? focusApp.app + ' ' : '') + feature + ' CTR ' + fmtPct_(scope.ctrPct, 2) + ' over ' + data.dataPeriod.days + ' days.'
+      ? (focusApp ? focusApp.app + ' ' : '') + feature + ' CTR ' + fmtPct_(scope.ctrPct, 2) + (data.reportMode === 'weekly' ? ' this week.' : ' over ' + data.dataPeriod.days + ' days.')
       : ai.headline,
     observations: ai.observations.filter(o => !isOffTopic_(o, feature)),
     nextSteps: ai.nextSteps.filter(s => !isOffTopic_(s.action + ' ' + s.pic, feature)),
@@ -679,6 +845,7 @@ function splitSentences_(text) {
 }
 
 function buildGeminiPrompt_(data, focusApp) {
+  if (data.reportMode === 'weekly') return buildWeeklyGeminiPrompt_(data, focusApp);
   const appLines = LS_CONFIG.APPS.map(a => '- ' + a.label + ': ' + a.description);
   const payload = focusApp ? {
     feature: data.feature,
@@ -754,6 +921,97 @@ function buildGeminiPrompt_(data, focusApp) {
   ].join('\n');
 }
 
+/** Prompt for the weekly review: this week vs last week. Shares the output schema and rules with the daily prompt. */
+function buildWeeklyGeminiPrompt_(data, focusApp) {
+  const appLines = LS_CONFIG.APPS.map(a => '- ' + a.label + ': ' + a.description);
+  const appWeekly = a => ({
+    app: a.app,
+    weeks: a.weeks,
+    thisWeekVsLastWeek: a.weekCompare,
+    dailyLast14Days: a.dailySeries.slice(-14).map(r => ({ date: r.date, dau: r.dau, featureUsers: r.featureUsers, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }))
+  });
+  const base = {
+    feature: data.feature,
+    weekDefinition: 'Weeks are rolling 7-day blocks ending on the latest date in the data (this week = the last 7 days).',
+    metricDefinitions: {
+      wau: 'distinct users who opened ' + data.feature + ' during the week',
+      visits: 'daily feature users summed over the week (one user on 3 days = 3 visits)',
+      ctrPct: 'visits ÷ app DAU summed over the week',
+      newUsers: 'users who opened ' + data.feature + ' for the first time ever during the week',
+      returningUsers: 'WAU minus new users (used it before this week)',
+      retainedFromPrev: 'users active in both this week and the previous week; retentionPct = retainedFromPrev ÷ previous week WAU',
+      churnedFromPrev: 'previous-week users who did not come back this week',
+      cameBackFromEarlier: 'returning users who were not active in the previous week',
+      repeatInWeek: 'users active on 2 or more days within the week'
+    },
+    weeksInData: data.weekly.windows.length,
+    dataQualityIssues: focusApp ? data.dataQualityIssues.filter(i => i.indexOf(focusApp.app + ' ') === 0) : data.dataQualityIssues
+  };
+  const payload = focusApp
+    ? Object.assign(base, {
+      focusApp: Object.assign({ description: focusApp.appDescription }, appWeekly(focusApp)),
+      benchmarkOtherAppsThisWeek: data.apps.filter(a => a !== focusApp).map(a => ({
+        app: a.app, wau: a.weekCompare.current.wau, ctrPct: a.weekCompare.current.ctrPct, newUsers: a.weekCompare.current.newUsers, retentionPct: a.weekCompare.current.retentionPct
+      }))
+    })
+    : Object.assign(base, { allAppsCombined: { weeks: data.weekly.combined, thisWeekVsLastWeek: data.weekly.combinedCompare }, apps: data.apps.map(appWeekly) });
+
+  const scope = focusApp ? [
+    'SLIDE SCOPE: weekly review of ' + data.feature + ' in ' + focusApp.app + ' ONLY: this week vs last week.',
+    'Explain what changed week over week: WAU, CTR, new users, returning users, retention and churn. Use benchmarkOtherAppsThisWeek only as a brief comparison.'
+  ] : [
+    'SLIDE SCOPE: weekly review of ' + data.feature + ' across all apps (' + data.apps.map(a => a.app).join(' vs ') + '): this week vs last week.',
+    'Explain the combined week-over-week change and which app drove it.'
+  ];
+
+  return [
+    'You are a senior product analytics consultant at SawitPRO (palm-oil / FFB supply chain platform in Indonesia).',
+    'You are writing the WEEKLY review of the "' + data.feature + '" feature.',
+    '',
+    'PRODUCT CONTEXT',
+    'The feature: ' + data.feature + ' — ' + (LS_CONFIG.FEATURE_CONTEXT[data.feature] || 'a SawitPRO app feature') + '.',
+    'It is available in these app versions:',
+    appLines.join('\n'),
+    'Interpret differences between the apps in light of who their users are.',
+    '',
+    scope.join('\n'),
+    '',
+    'Output must be valid JSON matching this schema:',
+    '{',
+    '  "headline": "Clear single executive takeaway sentence about this week vs last week",',
+    '  "observations": ["Observation 1", "Observation 2", "Observation 3"],',
+    '  "next_steps": [{"action": "Actionable item description", "pic": "Owner/Team"}],',
+    '  "speaker_notes": "A detailed presentation script: walk through WAU this week vs last week, the bridge (who did not return, new users, users back from earlier weeks), CTR, retention, notable days inside the weeks, data quality warnings, and the reasoning behind each recommendation."',
+    '}',
+    '',
+    'Rules (the slide has limited space, keep on-slide text short):',
+    '- Write in ' + LS_CONFIG.OUTPUT_LANGUAGE + '.',
+    '- Always compare this week with last week and quote both numbers (e.g. "WAU 15 vs 25 last week").',
+    '- Use plain business language. Never write JSON field names (e.g. retainedFromPrev, ctrPct, wau); say "WAU", "CTR", "retained users", "new users". Write dates like "22 Oct".',
+    '- Ground every statement in DATA and quote numbers exactly as given; always say which app a number belongs to.',
+    '- If weeksInData < 3, say that only ' + data.weekly.windows.length + ' week(s) can be compared so trends are early signals.',
+    '- If dataQualityIssues is not empty, mention the most important one in an observation.',
+    '',
+    'ACTION PLAN RULES (next_steps):',
+    '- Every action must be about the ' + data.feature + ' feature itself: getting more users to open it, getting last week\'s users to come back, or understanding why usage moved.',
+    '- Good action types: a ' + data.feature + ' campaign or promo, ads, push notification / WhatsApp blast, in-app banner or reminder for ' + data.feature + ', ' +
+      'improving the ' + data.feature + ' flow or content, following up a user segment (users who did not return this week, new users of this week, repeat users), ' +
+      'or investigating a specific week-over-week change or date.',
+    '- ' + data.feature + ' is the ONLY feature you may name. Do not mention, link to, bundle with or recommend changes to any other ' +
+      'SawitPRO feature, program, report or module (no loyalty programs, reward/tonnage claims, delivery reports, DO, affiliate).',
+    '- This applies to the headline, observations and speaker notes too, not only next_steps.',
+    '- At least one action must target the biggest week-over-week change (e.g. users who did not return, the drop in new users) and say what to check or do.',
+    '- Each action must follow from a number in DATA; mention that number briefly when it fits.',
+    '- headline: one sentence, max 20 words.',
+    '- observations: exactly 3 items, each max 24 words, no leading bullet characters.',
+    '- next_steps: exactly 3 items; "action" max 16 words; "pic" is a short team name (max 4 words).',
+    '- speaker_notes: no length limit.',
+    '',
+    'DATA:',
+    JSON.stringify(payload)
+  ].join('\n');
+}
+
 // Trims AI output to what fits on the slide; the full narrative lives in speaker notes.
 function normalizeAi_(parsed) {
   const clean = s => String(s || '').replace(/^[\s•\-*]+/, '').trim();
@@ -797,14 +1055,16 @@ function drawAppSlide_(slide, data, app, ai) {
   drawNextSteps_(slide, ai, L.actions);
 }
 
-function drawTitle_(slide, data, box, app) {
+function drawTitle_(slide, data, box, app, opts) {
+  opts = opts || {};
   const C = LS_CONFIG.COLORS;
   const parts = [{ text: data.feature, color: C.greenDark }];
   if (app) parts.push({ text: '  ·  ', color: C.muted }, { text: app.app, color: app.color });
-  parts.push({ text: app ? '   Feature Deep Dive' : '   Feature Analysis Snapshot · All Apps', color: C.muted, bold: false });
+  const suffix = opts.suffix || (app ? 'Feature Deep Dive' : 'Feature Analysis Snapshot · All Apps');
+  parts.push({ text: '   ' + suffix, color: C.muted, bold: false });
   addRichText_(slide, parts, box.x, box.y, 400, box.h, { fontSize: 12, bold: true, valign: 'MIDDLE' });
 
-  const pillText = 'PERIOD  ' + formatPeriod_(data.dataPeriod.start, data.dataPeriod.end) + '  ·  ' + data.dataPeriod.days + ' days';
+  const pillText = opts.pillText || 'PERIOD  ' + formatPeriod_(data.dataPeriod.start, data.dataPeriod.end) + '  ·  ' + data.dataPeriod.days + ' days';
   const pillW = estimateTextWidth_(pillText, 6.5, true) + 18;
   const pillX = box.x + box.w - pillW;
   pill_(slide, pillText, pillX, box.y + 2, pillW, 14, C.greenSoft, C.greenDark, 6.5);
@@ -1234,6 +1494,276 @@ function drawAppDailyChart_(slide, app, box) {
   });
 }
 
+/* ------------------------------ WEEKLY SLIDES ------------------------------ */
+
+function weeklyTitleOpts_(data, app) {
+  const w = data.weekly.windows;
+  const cur = w[w.length - 1], prev = w.length > 1 ? w[w.length - 2] : null;
+  return {
+    suffix: app ? 'Weekly Review' : 'Weekly Review · All Apps',
+    pillText: 'THIS WEEK  ' + formatRange_(cur.start, cur.end) + (prev ? '   vs   ' + formatRange_(prev.start, prev.end) : '')
+  };
+}
+
+/** Weekly summary: all apps side by side. */
+function drawWeeklySummarySlide_(slide, data, ai) {
+  const L = LS_CONFIG.LAYOUT;
+  drawTitle_(slide, data, L.title, null, weeklyTitleOpts_(data, null));
+  drawWeeklyKpiCards_(slide, data, data.weekly.combinedCompare, 'ALL APPS', L.kpi);
+  drawWeeklyAppsTable_(slide, data, L.funnel);
+  drawWauByWeek_(slide, data, L.chart);
+  drawObservations_(slide, ai, L.observations);
+  drawNextSteps_(slide, ai, L.actions);
+}
+
+/** Weekly review for one app. */
+function drawWeeklyAppSlide_(slide, data, app, ai) {
+  const L = LS_CONFIG.LAYOUT;
+  drawTitle_(slide, data, L.title, app, weeklyTitleOpts_(data, app));
+  drawWeeklyKpiCards_(slide, data, app.weekCompare, app.app.toUpperCase(), L.kpi);
+  drawWeeklyTable_(slide, data, app, L.funnel);
+  drawWauBridge_(slide, app, L.chart);
+  drawObservations_(slide, ai, L.observations);
+  drawNextSteps_(slide, ai, L.actions);
+}
+
+function fmtMetric_(value, metric) {
+  if (value == null) return '–';
+  if (metric.kind === 'pct') return fmtPct_(value, 2);
+  // Fixed decimals so a ratio column reads 1.0 / 1.3 rather than 1 / 1.3
+  return metric.digits ? Number(value).toFixed(metric.digits) : fmtNum_(value);
+}
+
+/** "▲ +3 (+12%)" / "▼ −1.19 pp" with matching colours; higher is better for every weekly metric. */
+function deltaStyle_(delta, metric) {
+  const C = LS_CONFIG.COLORS;
+  if (!delta) return { text: 'n/a', ink: C.muted, fill: C.cardBg };
+  const d = delta.diff;
+  const arrow = d > 0 ? '▲ +' : d < 0 ? '▼ −' : '■ ';
+  let text = arrow + (metric.kind === 'pct' ? fmtNum_(Math.abs(d), 2) + ' pp' : fmtNum_(Math.abs(d), metric.digits || 0));
+  if (metric.kind !== 'pct' && delta.relPct != null && d !== 0) text += ' (' + (delta.relPct > 0 ? '+' : '−') + fmtNum_(Math.abs(delta.relPct), 0) + '%)';
+  return d > 0 ? { text: text, ink: C.okInk, fill: C.okSoft } : d < 0 ? { text: text, ink: C.red, fill: C.redSoft } : { text: text, ink: C.muted, fill: C.cardBg };
+}
+
+function drawWeeklyKpiCards_(slide, data, cmp, scopeLabel, box) {
+  const C = LS_CONFIG.COLORS;
+  const cur = cmp.current, prev = cmp.previous;
+  const metric = key => WEEK_METRICS.find(m => m.key === key) || { key: key, kind: 'pct' };
+  const sub = (key, prevText) => {
+    if (!prev) return { sub: 'first week in the data', subColor: null };
+    const st = deltaStyle_(cmp.deltas[key], metric(key));
+    return { sub: st.text + ' vs ' + prevText + ' last week', subColor: st.ink };
+  };
+  const cards = [
+    Object.assign({ label: scopeLabel + ' · ' + data.feature.toUpperCase() + ' WAU', value: fmtNum_(cur.wau), accent: C.greenDark },
+      sub('wau', fmtNum_(prev && prev.wau))),
+    Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.blue },
+      sub('ctrPct', fmtPct_(prev && prev.ctrPct, 2))),
+    Object.assign({ label: 'NEW USERS (FIRST TIME)', value: fmtNum_(cur.newUsers), accent: C.greenBar },
+      sub('newUsers', fmtNum_(prev && prev.newUsers))),
+    prev ? {
+      label: 'RETAINED FROM LAST WEEK',
+      value: fmtPct_(cur.retentionPct, 0),
+      sub: fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(cur.prevWau) + ' last-week users came back',
+      subColor: null,
+      accent: C.returning
+    } : { label: 'RETURNING USERS', value: fmtNum_(cur.returningUsers), sub: 'used it before this week', accent: C.returning }
+  ];
+  const gap = 8;
+  const w = (box.w - gap * (cards.length - 1)) / cards.length;
+  cards.forEach((card, i) => drawKpiCard_(slide, box.x + i * (w + gap), box.y, w, box.h, card));
+}
+
+/** Week-over-week table for one app: last week, this week, paired bars and the change. */
+function drawWeeklyTable_(slide, data, app, box) {
+  const C = LS_CONFIG.COLORS;
+  const cmp = app.weekCompare;
+  const cur = cmp.current, prev = cmp.previous;
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'WEEK OVER WEEK', box.x + 10, box.y + 8, 120);
+  addText_(slide, (prev ? 'Last week ' + formatRange_(prev.start, prev.end) + '  ·  ' : '') + 'This week ' + formatRange_(cur.start, cur.end),
+    box.x + box.w - 230, box.y + 8, 220, 11, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
+
+  const col = { label: box.x + 10, labelW: 128, prev: box.x + 140, cur: box.x + 186, numW: 40, bars: box.x + 236, barsW: 92, delta: box.x + box.w - 82, deltaW: 72 };
+  const headY = box.y + 23;
+  [['METRIC', col.label, col.labelW, 'START'], ['LAST WK', col.prev, col.numW, 'END'], ['THIS WK', col.cur, col.numW, 'END'], ['CHANGE', col.delta, col.deltaW, 'CENTER']]
+    .forEach(h => addText_(slide, h[0], h[1], headY, h[2], 7, { fontSize: 5.5, bold: true, color: C.muted, align: h[3] }));
+  hLine_(slide, box.x + 10, box.x + box.w - 10, headY + 9, C.border, 0.5);
+
+  const top = box.y + 35;
+  const rowH = (box.y + box.h - 5 - top) / WEEK_METRICS.length;
+  WEEK_METRICS.forEach((m, i) => {
+    const y = top + i * rowH;
+    if (i % 2 === 1) rect_(slide, SlidesApp.ShapeType.RECTANGLE, box.x + 6, y, box.w - 12, rowH, C.cardBg);
+    const key = m.key === 'wau';
+    addText_(slide, m.label, col.label, y, col.labelW, rowH, { fontSize: 6, bold: key, color: C.ink, valign: 'MIDDLE' });
+    const pv = prev ? prev[m.key] : null, cv = cur[m.key];
+    addText_(slide, fmtMetric_(pv, m), col.prev, y, col.numW, rowH, { fontSize: 6.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
+    addText_(slide, fmtMetric_(cv, m), col.cur, y, col.numW, rowH, { fontSize: 6.5, bold: true, color: app.color, align: 'END', valign: 'MIDDLE' });
+
+    // Paired bars on a per-row scale: last week (grey) above this week (app colour)
+    const max = Math.max(pv || 0, cv || 0);
+    if (max > 0) {
+      const barH = Math.min(3.2, rowH / 2 - 1);
+      if (pv) rect_(slide, SlidesApp.ShapeType.RECTANGLE, col.bars, y + rowH / 2 - barH - 0.4, Math.max(1.5, col.barsW * pv / max), barH, C.prevBar);
+      if (cv) rect_(slide, SlidesApp.ShapeType.RECTANGLE, col.bars, y + rowH / 2 + 0.4, Math.max(1.5, col.barsW * cv / max), barH, app.color);
+    }
+    const st = deltaStyle_(cmp.deltas[m.key], m);
+    pill_(slide, st.text, col.delta, y + 1, col.deltaW, rowH - 2, st.fill, st.ink, 5.5);
+  });
+}
+
+/** Week-over-week for all apps: one column group (last / this / change) per app. */
+function drawWeeklyAppsTable_(slide, data, box) {
+  const C = LS_CONFIG.COLORS;
+  const apps = data.apps;
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'WEEK OVER WEEK BY APP', box.x + 10, box.y + 8, 160);
+
+  const labelW = 112;
+  const groupX = box.x + 10 + labelW + 4;
+  const groupW = (box.x + box.w - 10 - groupX) / apps.length;
+  const sub = { prev: 0.02, cur: 0.30, delta: 0.56 };
+  const numW = groupW * 0.26, deltaW = groupW * 0.42;
+
+  apps.forEach((a, g) => {
+    const gx = groupX + g * groupW;
+    pill_(slide, a.app, gx + 2, box.y + 22, groupW - 4, 11, a.color, C.white, 6);
+    [['LAST', gx + groupW * sub.prev, numW, 'END'], ['THIS', gx + groupW * sub.cur, numW, 'END'], ['CHANGE', gx + groupW * sub.delta, deltaW, 'CENTER']]
+      .forEach(h => addText_(slide, h[0], h[1], box.y + 36, h[2], 6, { fontSize: 5, bold: true, color: C.muted, align: h[3] }));
+  });
+  addText_(slide, 'METRIC', box.x + 10, box.y + 36, labelW, 6, { fontSize: 5, bold: true, color: C.muted });
+  hLine_(slide, box.x + 10, box.x + box.w - 10, box.y + 44, C.border, 0.5);
+
+  const top = box.y + 46;
+  const rowH = (box.y + box.h - 4 - top) / WEEK_METRICS.length;
+  WEEK_METRICS.forEach((m, i) => {
+    const y = top + i * rowH;
+    if (i % 2 === 1) rect_(slide, SlidesApp.ShapeType.RECTANGLE, box.x + 6, y, box.w - 12, rowH, C.cardBg);
+    addText_(slide, m.label, box.x + 10, y, labelW, rowH, { fontSize: 5.5, bold: m.key === 'wau', color: C.ink, valign: 'MIDDLE' });
+    apps.forEach((a, g) => {
+      const gx = groupX + g * groupW;
+      const cmp = a.weekCompare;
+      addText_(slide, fmtMetric_(cmp.previous ? cmp.previous[m.key] : null, m), gx + groupW * sub.prev, y, numW, rowH, { fontSize: 6, color: C.muted, align: 'END', valign: 'MIDDLE' });
+      addText_(slide, fmtMetric_(cmp.current[m.key], m), gx + groupW * sub.cur, y, numW, rowH, { fontSize: 6, bold: true, color: a.color, align: 'END', valign: 'MIDDLE' });
+      const st = deltaStyle_(cmp.deltas[m.key], m);
+      pill_(slide, st.text, gx + groupW * sub.delta, y + 0.8, deltaW, rowH - 1.6, st.fill, st.ink, 5);
+    });
+  });
+}
+
+/**
+ * WAU bridge: last week's users → who did not return → new users → users back from earlier weeks → this week's users.
+ */
+function drawWauBridge_(slide, app, box) {
+  const C = LS_CONFIG.COLORS;
+  const cmp = app.weekCompare;
+  const cur = cmp.current, prev = cmp.previous;
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'WAU BRIDGE · LAST WEEK → THIS WEEK', box.x + 10, box.y + 8, 220);
+  if (!prev || cur.wau == null || cur.retainedFromPrev == null) {
+    addText_(slide, 'A week-over-week bridge needs two full weeks of data with user names.', box.x + 10, box.y + 40, box.w - 20, 20,
+      { fontSize: 7, color: C.muted, align: 'CENTER', valign: 'MIDDLE' });
+    return;
+  }
+  addRichText_(slide, [
+    { text: 'Retention  ', color: C.muted },
+    { text: fmtPct_(cur.retentionPct, 0), bold: true, color: C.ink },
+    { text: '  (' + fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(prev.wau) + ')', color: C.muted }
+  ], box.x + box.w - 150, box.y + 8, 140, 11, { fontSize: 6, align: 'END', valign: 'MIDDLE' });
+
+  const steps = [
+    { label: 'Last week\n' + formatRange_(prev.start, prev.end), from: 0, to: prev.wau, color: C.prevBar, text: fmtNum_(prev.wau) },
+    { label: 'Did not\nreturn', from: cur.retainedFromPrev, to: prev.wau, color: C.red, text: '−' + fmtNum_(cur.churnedFromPrev) },
+    { label: 'Retained', from: 0, to: cur.retainedFromPrev, color: app.soft, border: app.color, ink: app.color, text: fmtNum_(cur.retainedFromPrev) },
+    { label: 'New users', from: cur.retainedFromPrev, to: cur.retainedFromPrev + cur.newUsers, color: app.color, text: '+' + fmtNum_(cur.newUsers) }
+  ];
+  let level = cur.retainedFromPrev + cur.newUsers;
+  if (cur.cameBackFromEarlier) {
+    steps.push({ label: 'Back from\nearlier weeks', from: level, to: level + cur.cameBackFromEarlier, color: C.returning, text: '+' + fmtNum_(cur.cameBackFromEarlier) });
+    level += cur.cameBackFromEarlier;
+  }
+  steps.push({ label: 'This week\n' + formatRange_(cur.start, cur.end), from: 0, to: cur.wau, color: app.color, text: fmtNum_(cur.wau), strong: true });
+
+  const plot = { x: box.x + 20, y: box.y + 34, w: box.w - 40, h: box.h - 34 - 20 };
+  const max = niceMax_(Math.max(1, prev.wau, cur.wau, level));
+  const band = plot.w / steps.length;
+  const barW = Math.min(46, band * 0.5);
+  const yOf = v => plot.y + plot.h - (v / max) * plot.h;
+  hLine_(slide, plot.x, plot.x + plot.w, plot.y + plot.h, C.border, 0.75);
+
+  steps.forEach((st, i) => {
+    const cx = plot.x + (i + 0.5) * band;
+    const top = yOf(Math.max(st.from, st.to)), bottom = yOf(Math.min(st.from, st.to));
+    if (bottom - top >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, cx - barW / 2, top, barW, bottom - top, st.color, st.border, 0.75);
+    addText_(slide, st.text, cx - 25, top - 10, 50, 8, { fontSize: st.strong ? 7.5 : 6.5, bold: true, color: st.ink || (st.color === C.prevBar ? C.muted : st.color), align: 'CENTER', valign: 'MIDDLE' });
+    addText_(slide, st.label, cx - band / 2, plot.y + plot.h + 2, band, 14, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+    // Dotted connector to the next step's starting level
+    if (i < steps.length - 1) {
+      const level = st.color === C.red ? st.from : st.to;
+      const line = hLine_(slide, cx + barW / 2, cx + band - barW / 2, yOf(level), C.muted, 0.5);
+      line.setDashStyle(SlidesApp.DashStyle.DOT);
+    }
+  });
+}
+
+/** WAU per week for every app: stacked new (solid) + returning (light) bars, grouped by week. */
+function drawWauByWeek_(slide, data, box) {
+  const C = LS_CONFIG.COLORS;
+  const apps = data.apps;
+  const windows = data.weekly.windows;
+  const n = windows.length;
+
+  panel_(slide, box);
+  sectionTitle_(slide, 'WAU BY WEEK', box.x + 10, box.y + 8, 80);
+
+  let lx = box.x + box.w - 10;
+  const legend = apps.map(a => ({ label: a.app, color: a.color })).concat([{ label: 'light = returning', color: null }]);
+  legend.slice().reverse().forEach(item => {
+    const tw = estimateTextWidth_(item.label, 6) + 4;
+    lx -= tw;
+    addText_(slide, item.label, lx, box.y + 8, tw, 11, { fontSize: 6, color: item.color ? C.ink : C.muted, valign: 'MIDDLE' });
+    if (item.color) {
+      lx -= 10;
+      rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, box.y + 10, 7, 7, item.color);
+    }
+    lx -= 10;
+  });
+
+  const plot = { x: box.x + 30, y: box.y + 32, w: box.w - 40, h: box.h - 32 - 16 };
+  const max = niceMax_(Math.max(1, ...apps.map(a => Math.max(...a.weeks.map(w => w.wau || w.visits || 0)))));
+  const yOf = v => plot.y + plot.h - (v / max) * plot.h;
+  [0, 0.5, 1].forEach(fr => {
+    const gy = yOf(max * fr);
+    const line = hLine_(slide, plot.x, plot.x + plot.w, gy, fr === 0 ? C.border : C.grid, fr === 0 ? 0.75 : 0.5);
+    if (fr > 0) line.setDashStyle(SlidesApp.DashStyle.DOT);
+    addText_(slide, fmtNum_(max * fr, 1), box.x + 4, gy - 4, plot.x - box.x - 8, 8, { fontSize: 5.5, color: C.muted, align: 'END', valign: 'MIDDLE' });
+  });
+
+  const band = plot.w / n;
+  const barW = Math.min(30, (band * 0.7) / apps.length);
+  windows.forEach((w, wi) => {
+    const groupX = plot.x + wi * band + (band - barW * apps.length) / 2;
+    apps.forEach((a, ai) => {
+      const wk = a.weeks[wi];
+      const total = wk.wau != null ? wk.wau : wk.visits;
+      const x = groupX + ai * barW;
+      const segs = wk.wau != null && wk.newUsers != null ? [[wk.newUsers, a.color], [wk.returningUsers, a.soft]] : [[total, a.color]];
+      let y = plot.y + plot.h;
+      segs.forEach(sg => {
+        const h = (sg[0] / max) * plot.h;
+        if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, x + 1, y - h, barW - 2, h, sg[1], a.color, 0.5);
+        y -= h;
+      });
+      addText_(slide, fmtNum_(total), x - 6, y - 9, barW + 12, 8, { fontSize: 6, bold: true, color: a.color, align: 'CENTER', valign: 'MIDDLE' });
+    });
+    addText_(slide, formatRange_(w.start, w.end), plot.x + wi * band, plot.y + plot.h + 3, band, 8, { fontSize: 5.5, color: C.muted, align: 'CENTER' });
+  });
+}
+
 function drawObservations_(slide, ai, box) {
   const C = LS_CONFIG.COLORS;
   headerPanel_(slide, box, 'EXECUTIVE OBSERVATIONS');
@@ -1440,6 +1970,16 @@ function fmtPct_(value, digits) {
 
 function formatShortDate_(key) {
   return Utilities.formatDate(parseDate_(key), Session.getScriptTimeZone(), 'd MMM');
+}
+
+/** "15–21 Oct", or "29 Sep – 5 Oct" across months. */
+function formatRange_(startKey, endKey) {
+  const tz = Session.getScriptTimeZone();
+  const start = parseDate_(startKey), end = parseDate_(endKey);
+  if (start.getMonth() === end.getMonth() && start.getFullYear() === end.getFullYear()) {
+    return Utilities.formatDate(start, tz, 'd') + '–' + Utilities.formatDate(end, tz, 'd MMM');
+  }
+  return Utilities.formatDate(start, tz, 'd MMM') + ' – ' + Utilities.formatDate(end, tz, 'd MMM');
 }
 
 function formatPeriod_(startKey, endKey) {
