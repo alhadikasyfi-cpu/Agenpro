@@ -19,8 +19,12 @@ const CORE = {
   // Only complete weeks are compared; days of a week still in progress wait for the next run.
   WEEK_START_DAY: 4,
   MAX_WEEKS: 8,
-  // Extra Gemini rounds asking it to rewrite an answer that mentions other features
+  // Extra Gemini rounds asking it to rewrite an answer that breaks the feature-only or PM-action rules
   GEMINI_MAX_RETRIES: 2,
+  // Action items must be things a Product Manager ships or launches, not analysis work for a data analyst
+  ANALYST_ACTION_PATTERNS: [/investigat/i, /analy[sz]/i, /\baudit/i, /look into/i, /find out/i, /understand why/i, /deep[- ]?dive/i,
+    /root cause/i, /\bcheck (why|what|whether|if)\b/i, /\b(track|tracking|instrument|monitor)\b/i, /\binterview/i, /\bsurvey/i,
+    /\bresearch\b/i, /cari tahu/i, /selidiki/i, /analisis/i, /\bcek\b/i],
 
   // Slides text boxes carry built-in padding that SlidesApp cannot change.
   // addText_ expands every box by these insets so text lands exactly on the layout grid.
@@ -166,7 +170,7 @@ function generateFeatures_(ids) {
       spec.draw(newSlide, aiResults[i]);
       if (aiResults[i].speakerNotes) newSlide.getNotesPage().getSpeakerNotesShape().getText().setText(aiResults[i].speakerNotes);
       if (aiResults[i].removedOffTopic) {
-        warnings.push(spec.title + ' — AI text mentioning other features removed (' + aiResults[i].removedOffTopic + ' item(s))');
+        warnings.push(spec.title + ' — AI text removed: other features or analysis-type actions (' + aiResults[i].removedOffTopic + ' item(s))');
       }
     });
 
@@ -457,13 +461,14 @@ function callGeminiAll_(specs) {
       const text = JSON.parse(response.getContentText()).candidates[0].content.parts[0].text;
       results[i] = normalizeAi_(JSON.parse(text));
       const feature = specs[i].ai.feature;
-      const offending = offTopicTexts_(results[i], feature);
+      const offending = offTopicTexts_(results[i], feature).concat(analystActions_(results[i]));
       if (offending.length && attempt < CORE.GEMINI_MAX_RETRIES) {
         conversations[i].push(
           { role: 'model', parts: [{ text: text }] },
-          { role: 'user', parts: [{ text: 'Your answer breaks the rule that ' + feature + ' is the only feature you may mention. ' +
-            'These parts mention other features or programs:\n- ' + offending.join('\n- ') + '\n' +
-            'Rewrite the whole JSON. Every observation and action must be about ' + feature + ' only.' }] }
+          { role: 'user', parts: [{ text: 'Your answer breaks the slide rules (' + feature + ' is the only feature you may mention, and ' +
+            'actions must be Product Manager actions). These parts break them:\n- ' + offending.join('\n- ') + '\n' +
+            'Rewrite the whole JSON. Every observation and action must be about ' + feature + ' only, and every action must be a ' +
+            'concrete product change or campaign a Product Manager can ship — no investigation, analysis, tracking or research tasks.' }] }
         );
         retry.push(i);
       }
@@ -507,13 +512,15 @@ function buildGeminiPrompt_(a) {
   ].concat(a.extraRules || []).concat([
     '',
     'ACTION PLAN RULES (next_steps):',
-    '- Every action must be about the ' + a.feature + ' feature itself: getting more users to use it, getting them to come back, ' +
-      'improving its flow or content, or understanding why its numbers moved.',
-    '- Good action types: a ' + a.feature + ' campaign or promo, ads, push notification / WhatsApp blast, in-app banner or reminder, ' +
-      'improving the ' + a.feature + ' flow or content, following up a specific user segment, or investigating a specific change or date.',
+    '- Actions are for the Product Manager: concrete things they can ship, change or launch for the ' + a.feature + ' feature itself ' +
+      'to get more users to use it, get them to come back, or remove friction in its flow.',
+    '- Good action types: a ' + a.feature + ' campaign or promo, ads, push notification / WhatsApp blast to a specific user segment, ' +
+      'in-app banner, reminder or entry point, onboarding or copy change, UX change to a funnel step, incentive, content or listing change.',
+    '- Do NOT recommend analysis or research work for a data analyst: no investigating, analysing, auditing, checking why, ' +
+      'tracking or instrumentation, monitoring, interviews or surveys. State the product action directly instead.',
     '- ' + a.feature + ' is the ONLY feature you may name. Do not mention, link to, bundle with or recommend changes to any other ' +
       'SawitPRO feature, program, report or module. This applies to the headline, observations and speaker notes too.',
-    '- At least one action must target the biggest change in DATA and say what to check or do.',
+    '- At least one action must respond to the biggest change or drop-off in DATA with a concrete product change or campaign.',
     '- Each action must follow from a number in DATA; mention that number briefly when it fits.',
     '- headline: one sentence, max 20 words.',
     '- observations: exactly 3 items, each max 24 words, no leading bullet characters.',
@@ -543,14 +550,19 @@ function offTopicTexts_(ai, feature) {
   return texts.filter(t => isOffTopic_(t, feature));
 }
 
-/** Last resort after the retries: drop whatever still mentions another feature. */
+/** Action items that are analysis / research work rather than a product action. */
+function analystActions_(ai) {
+  return ai.nextSteps.map(s => s.action).filter(t => CORE.ANALYST_ACTION_PATTERNS.some(re => re.test(t)));
+}
+
+/** Last resort after the retries: drop whatever still mentions another feature, and analysis-type action items. */
 function removeOffTopic_(ai, a) {
-  const before = offTopicTexts_(ai, a.feature).length;
+  const before = offTopicTexts_(ai, a.feature).length + analystActions_(ai).length;
   if (!before) return ai;
   return {
     headline: isOffTopic_(ai.headline, a.feature) ? a.fallbackHeadline : ai.headline,
     observations: ai.observations.filter(o => !isOffTopic_(o, a.feature)),
-    nextSteps: ai.nextSteps.filter(s => !isOffTopic_(s.action + ' ' + s.pic, a.feature)),
+    nextSteps: ai.nextSteps.filter(s => !isOffTopic_(s.action + ' ' + s.pic, a.feature) && !CORE.ANALYST_ACTION_PATTERNS.some(re => re.test(s.action))),
     speakerNotes: splitSentences_(ai.speakerNotes).filter(t => !isOffTopic_(t, a.feature)).join(' '),
     removedOffTopic: before
   };

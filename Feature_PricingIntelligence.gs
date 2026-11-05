@@ -55,7 +55,7 @@ function pricingIntelligenceFeature_() {
             'Weekly review of Pricing Intelligence in AgenPRO: this week vs last week (Thursday–Wednesday), the before/after effect ' +
               'of moving the price list to Home, and price coverage (how many mills and ramps update their prices regularly).',
             'Do not treat the drop in detail users after the move as a failure by default: prices are now visible on Home without ' +
-              'opening the detail. Say what is needed to measure Home usage, and what the drop does tell us.'
+              'opening the detail. Recommend product changes that make the Home price list more useful and bring users to the detail when it adds value.'
           ],
           definitions: {
             appWau: 'AgenPRO weekly active users',

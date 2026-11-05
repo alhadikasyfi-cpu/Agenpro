@@ -1,5 +1,6 @@
 /**
- * FFB Transaction (TimPRO) — Partner vs Non-Partner tonnage, price and cutting ratio.
+ * FFB Transaction (TimPRO) — Partner vs Non-Partner tonnage (and cutting ratio when the sheet has it).
+ * Prices are not analysed: partner transactions are often entered without a price.
  * Sheet "FFB transaction Timpro (P, np)": one row per date with total_transactions and a details cell holding every
  * transaction of that day ("type; field; field; …" separated by ", "). The field order is read from the header text in
  * parentheses, so a new field such as cutting_ratio_pct is picked up once it is added to the header and the details.
@@ -29,11 +30,8 @@ function ffbTransactionFeature_() {
       if (!report) throw new Error('needs at least one complete month of data');
       const prev = months.find(m => m.month === previousMonthKey_(report.month)) || null;
       const weekly = weeklyFfb_(tx);
+      // Cutting ratio is only analysed when the sheet has it
       const hasCutting = tx.some(t => t.cuttingRatioPct != null);
-      if (!hasCutting) issues.push('cutting_ratio_pct is not in the sheet yet (add it to the header and the details to show it)');
-      report.byType.forEach(g => {
-        if (g.tx && !g.pricedTx) issues.push(monthLabel_(report.month) + ': all ' + g.tx + ' ' + FFB_CONFIG.TYPE_LABELS[g.type] + ' transactions have price 0, so no average price');
-      });
       const title = 'FFB Transaction · ' + app.label;
 
       return [{
@@ -43,20 +41,19 @@ function ffbTransactionFeature_() {
           app: app,
           description: 'FFB/TBS deliveries recorded by pengurus in TimPRO. PARTNER = delivered to a mill that partners with SawitPRO ' +
             '(earns the partner program benefits). NON_PARTNER = delivered to a non-partner mill; the pengurus uploads or enters the ' +
-            'weighbridge ticket to earn the TimPRO non-partner program benefits. Cutting ratio = deduction weight ÷ gross weight; ' +
-            'higher means more rejected fruit (unripe, long stalks, rotten, dirt).',
+            'weighbridge ticket to earn the TimPRO non-partner program benefits.' + (hasCutting ? ' Cutting ratio = deduction weight ÷ ' +
+            'gross weight; higher means more rejected fruit (unripe, long stalks, rotten, dirt).' : ''),
           scope: [
             'Monthly review of ' + monthLabel_(report.month) + ' vs ' + (prev ? monthLabel_(prev.month) : 'no previous month') +
-              ': total, partner and non-partner tonnage, partner share, average price and cutting ratio, plus the weekly tonnage trend.'
+              ': total, partner and non-partner tonnage and partner share' + (hasCutting ? ', cutting ratio' : '') +
+              ', plus the weekly tonnage trend. Focus on tonnage.'
           ],
-          definitions: {
+          definitions: Object.assign({
             kg: 'sum of weight_net_kg; tonnes = kg ÷ 1000',
-            avgPrice: 'kg-weighted average price per kg of transactions with a price; price 0 means not recorded and is excluded',
-            avgCuttingRatioPct: 'average cutting_ratio_pct of the group (null when the column is missing)',
             partnerSharePct: 'partner kg ÷ total kg',
             topMills: 'mills (buyer) with the most kg in the report month'
-          },
-          extraRules: ['- If a group has no priced transactions, say its price is not available instead of comparing prices.'],
+          }, hasCutting ? { avgCuttingRatioPct: 'average cutting_ratio_pct of the group' } : {}),
+          extraRules: ['- Do not discuss prices; they are often not entered.'],
           payload: {
             reportMonth: report,
             previousMonth: prev,
@@ -76,7 +73,7 @@ function generateFfbTransactionSlides() {
   generateFeatures_(['ffb_transaction']);
 }
 
-/** All transactions, oldest first: { date, type, price, kg, buyer, cuttingRatioPct }. */
+/** All transactions, oldest first: { date, type, kg, buyer, cuttingRatioPct }. */
 function readFfbTransactions_(ss, issues) {
   const table = readTable_(ss, FFB_CONFIG.SHEET, {
     date: ['transaction_date', 'date', 'tanggal'],
@@ -91,7 +88,6 @@ function readFfbTransactions_(ss, issues) {
   const idx = name => fields.indexOf(name);
   const at = {
     type: idx('partner_type'),
-    price: idx('price_per_kg'),
     kg: idx('weight_net_kg'),
     buyer: idx('buyer_name'),
     cutting: fields.findIndex(f => /cutting_ratio/.test(f))
@@ -118,7 +114,6 @@ function readFfbTransactions_(ss, issues) {
       tx.push({
         date: date,
         type: type,
-        price: at.price >= 0 ? toNumber_(f[at.price]) : 0,
         kg: toNumber_(f[at.kg]),
         buyer: at.buyer >= 0 ? String(f[at.buyer] || '').trim().toUpperCase() : '',
         cuttingRatioPct: at.cutting >= 0 ? numOrNull_(f[at.cutting]) : null
@@ -132,19 +127,15 @@ function readFfbTransactions_(ss, issues) {
 
 /** Totals of a group of transactions. */
 function ffbGroup_(list, type) {
-  const priced = list.filter(t => t.price > 0);
-  const pricedKg = priced.reduce((a, t) => a + t.kg, 0);
   const cut = list.filter(t => t.cuttingRatioPct != null);
-  return {
+  const group = {
     type: type,
     tx: list.length,
     kg: Math.round(list.reduce((a, t) => a + t.kg, 0)),
-    pricedTx: priced.length,
-    zeroPriceTx: list.length - priced.length,
-    avgPrice: pricedKg ? Math.round(priced.reduce((a, t) => a + t.price * t.kg, 0) / pricedKg) : null,
-    avgKgPerTx: list.length ? Math.round(list.reduce((a, t) => a + t.kg, 0) / list.length) : null,
-    avgCuttingRatioPct: cut.length ? round2_(cut.reduce((a, t) => a + t.cuttingRatioPct, 0) / cut.length) : null
+    avgKgPerTx: list.length ? Math.round(list.reduce((a, t) => a + t.kg, 0) / list.length) : null
   };
+  if (cut.length) group.avgCuttingRatioPct = round2_(cut.reduce((a, t) => a + t.cuttingRatioPct, 0) / cut.length);
+  return group;
 }
 
 /** One entry per month (oldest first, last MAX_MONTHS): totals per type, partner share and top mills. */
@@ -164,6 +155,7 @@ function monthlyFfb_(tx) {
     return {
       month: month,
       lastDay: list[list.length - 1].date,
+      days: new Set(list.map(t => t.date)).size,
       total: total,
       byType: byType,
       partnerSharePct: total.kg ? round1_((byType[0].kg / total.kg) * 100) : null,
@@ -203,6 +195,18 @@ function weeklyFfb_(tx) {
   });
 }
 
+/** KPI card: partner share of tonnage in the report month vs the previous month (in pp). */
+function partnerShareCard_(report, prev) {
+  const C = CORE.COLORS;
+  const card = { label: 'PARTNER SHARE OF TONNAGE', value: fmtPct_(report.partnerSharePct, 1), accent: C.returning };
+  if (prev && prev.partnerSharePct != null) {
+    const st = deltaStyle_({ diff: round2_(report.partnerSharePct - prev.partnerSharePct) }, { kind: 'pct' });
+    card.sub = st.text + ' vs ' + fmtPct_(prev.partnerSharePct, 1) + ' last month';
+    card.subColor = st.ink;
+  }
+  return card;
+}
+
 function fmtTonnes_(kg) {
   return kg == null ? '–' : fmtNum_(kg / 1000, kg < 10000 ? 1 : 0) + ' t';
 }
@@ -230,13 +234,7 @@ function drawFfbSlide_(slide, app, months, report, prev, weekly, hasCutting, ai,
     tonCard('TOTAL TONNAGE · ' + monthLabel_(report.month).toUpperCase(), report.total.kg, prev && prev.total.kg, C.blue),
     tonCard('PARTNER TONNAGE', p.kg, pp && pp.kg, C.greenDark),
     tonCard('NON-PARTNER TONNAGE', np.kg, pnp && pnp.kg, C.nonPartner),
-    {
-      label: 'AVG PRICE · PARTNER vs NON',
-      value: (p.avgPrice ? fmtNum_(p.avgPrice) : 'n/a') + ' | ' + (np.avgPrice ? fmtNum_(np.avgPrice) : 'n/a'),
-      sub: 'Rp/kg · price 0 excluded',
-      subColor: p.avgPrice && np.avgPrice ? null : C.amber,
-      accent: C.returning
-    }
+    partnerShareCard_(report, prev)
   ]);
 
   drawFfbMonthlyPanel_(slide, L.main, months, report, hasCutting);
@@ -286,19 +284,17 @@ function drawFfbMonthlyPanel_(slide, box, months, report, hasCutting) {
     ['Share of tonnage', fmtPct_(report.partnerSharePct, 1), fmtPct_(report.partnerSharePct == null ? null : 100 - report.partnerSharePct, 1)],
     ['Transactions', fmtNum_(p.tx), fmtNum_(np.tx)],
     ['Avg kg / transaction', fmtNum_(p.avgKgPerTx), fmtNum_(np.avgKgPerTx)],
-    ['Avg price (Rp/kg)', p.avgPrice ? fmtNum_(p.avgPrice) : 'n/a', np.avgPrice ? fmtNum_(np.avgPrice) : 'n/a'],
-    ['Transactions with price', fmtNum_(p.pricedTx) + ' of ' + fmtNum_(p.tx), fmtNum_(np.pricedTx) + ' of ' + fmtNum_(np.tx)],
-    ['Avg cutting ratio', hasCutting ? fmtPct_(p.avgCuttingRatioPct, 2) : 'not in sheet', hasCutting ? fmtPct_(np.avgCuttingRatioPct, 2) : 'not in sheet']
+    ['Avg tonnes / day', fmtTonnes_(Math.round(p.kg / report.days)), fmtTonnes_(Math.round(np.kg / report.days))]
   ];
+  if (hasCutting) rows.push(['Avg cutting ratio', fmtPct_(p.avgCuttingRatioPct, 2), fmtPct_(np.avgCuttingRatioPct, 2)]);
   const rowTop = top + 13, rowH = (box.y + box.h - 6 - rowTop) / rows.length;
   rows.forEach((r, i) => {
     const y = rowTop + i * rowH;
     if (i % 2 === 0) rect_(slide, SlidesApp.ShapeType.RECTANGLE, t.x - 3, y, t.w + 3, rowH, C.cardBg);
     addText_(slide, r[0], t.x, y, colW.label, rowH, { fontSize: 6, color: C.ink, valign: 'MIDDLE' });
     [r[1], r[2]].forEach((v, k) => {
-      const missing = v === 'n/a' || v === 'not in sheet';
       addText_(slide, v, t.x + colW.label + k * colW.p, y, colW.p - 4, rowH,
-        { fontSize: 6.5, bold: !missing, color: missing ? C.amber : k === 0 ? C.greenDark : C.ink, align: 'END', valign: 'MIDDLE' });
+        { fontSize: 6.5, bold: true, color: k === 0 ? C.greenDark : C.ink, align: 'END', valign: 'MIDDLE' });
     });
   });
 }
