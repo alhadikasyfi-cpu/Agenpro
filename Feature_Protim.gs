@@ -27,8 +27,11 @@ function protimFeature_() {
     },
     steps: [
       { key: 'menu', label: 'Open Protim menu', short: 'Menu' },
-      { key: 'confirm', label: 'Tap confirm', short: 'Confirm' },
-      { key: 'success', label: 'Confirm success', short: 'Success' }
+      // Weekly distinct users of these steps are estimated until the sheet has weekly columns for them
+      { key: 'confirm', label: 'Tap confirm', short: 'Confirm',
+        weeklyAliases: ['step3_weekly_users', 'step3_confirmed_weekly_users', 'weekly_step3_users', 'step3_wau'] },
+      { key: 'success', label: 'Confirm success', short: 'Success',
+        weeklyAliases: ['step4_weekly_users', 'step4_confirmed_success_weekly_users', 'weekly_step4_users', 'step4_wau'] }
     ],
     usersLabel: 'USERS OPEN PROTIM MENU'
   });

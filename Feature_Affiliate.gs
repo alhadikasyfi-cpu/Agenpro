@@ -25,7 +25,8 @@ function affiliateFeature_() {
     },
     steps: [
       { key: 'dashboard', label: 'Open affiliate dashboard', short: 'Dashboard' },
-      { key: 'share', label: 'Share affiliate link', short: 'Share link' }
+      { key: 'share', label: 'Share affiliate link', short: 'Share link',
+        weeklyAliases: ['step3_weekly_users', 'step3_share_weekly_users', 'weekly_step3_users', 'step3_wau'] }
     ],
     usersLabel: 'USERS OPEN DASHBOARD'
   });

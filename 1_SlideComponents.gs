@@ -12,7 +12,8 @@
  *   app: 'timpro' | 'agenpro'          — fixed app, or
  *   splitByColumn: true                — one slide per app found in the "segment" column (e.g. "Pasar Sawit Agenpro"),
  *   fields: { date, segment?, dau, <step keys>, newUsers?, returningUsers?, names?, appWau?, featureWau? } → header aliases,
- *   steps: [{ key, label }]            — feature steps in order; the first is "users of the feature",
+ *   steps: [{ key, label, short?, weeklyAliases? }] — feature steps in order; the first is "users of the feature";
+ *                                        weeklyAliases = headers of an optional weekly distinct-users column for a later step,
  *   usersLabel                         — KPI label for the first step's users, e.g. 'USERS OPEN DASHBOARD'
  * }
  * One step → funnel App WAU → feature users → returning users. Several steps → weekly totals through every step.
@@ -25,7 +26,10 @@ function createFunnelFeature_(def) {
     buildSlides: (ss, issues) => {
       const stepKeys = def.steps.map(s => s.key);
       const sheets = [].concat(def.sheet);
-      const table = readTable_(ss, sheets.find(n => ss.getSheetByName(n)) || sheets[0], def.fields, ['date', 'dau', stepKeys[0]]);
+      // Optional weekly distinct users of later steps (steps[i].weeklyAliases), read into "wau_<step key>"
+      const fields = Object.assign({}, def.fields);
+      def.steps.forEach(s => { if (s.weeklyAliases) fields['wau_' + s.key] = s.weeklyAliases; });
+      const table = readTable_(ss, sheets.find(n => ss.getSheetByName(n)) || sheets[0], fields, ['date', 'dau', stepKeys[0]]);
       const groups = {};
       table.rows.forEach(r => {
         const appKey = def.splitByColumn ? appKeyFromText_(r.segment) : def.app;
@@ -89,8 +93,10 @@ function weeklyDefinitions_(def) {
     appStickinessPct: 'average app DAU ÷ app WAU'
   };
   if (def.steps.length > 1) {
-    def.steps.forEach(s => d['step_' + s.key] = s.label + ': daily counts summed over the week');
-    d.completionPct = def.steps[def.steps.length - 1].label + ' ÷ ' + def.steps[0].label + ' (weekly totals)';
+    def.steps.forEach(s => d['step_' + s.key] = s.label + ': daily users summed over the week (user-days, not distinct users)');
+    def.steps.slice(1).forEach(s => d['users_' + s.key] = 'distinct users who did "' + s.label + '" this week; ' +
+      'when usersEstimated_' + s.key + ' is true it is an estimate (first-step users × ratio of daily counts) — say "about" when quoting it');
+    d.completionPct = def.steps[def.steps.length - 1].label + ' ÷ ' + def.steps[0].label + ' (daily users summed)';
   }
   return d;
 }
@@ -231,15 +237,18 @@ function stepFunnelView_(weekly, app, def) {
   const gaps = [[{ text: '▼ ' + fmtPct_(firstConv == null ? null : 100 - firstConv, 2), bold: true, color: C.red },
     { text: ' of ' + (hasWau ? 'app WAU' : 'DAU') + ' did not ' + first.label.toLowerCase() + ' this week', color: C.muted }]];
 
-  const base = cur['step_' + first.key];
+  let anyEstimate = false;
   def.steps.slice(1).forEach((s, k) => {
-    const v = cur['step_' + s.key];
-    const before = cur['step_' + def.steps[k].key];
-    const stepConv = before ? (v / before) * 100 : null;
+    const v = cur['users_' + s.key];
+    const est = cur['usersEstimated_' + s.key];
+    anyEstimate = anyEstimate || est;
+    const beforeUsers = k === 0 ? cur.clickUsers : cur['users_' + def.steps[k].key];
+    const stepConv = beforeUsers ? (v / beforeUsers) * 100 : null;
+    const pv = prev ? prev['users_' + s.key] : null;
     steps.push({
-      name: s.label, sub: lastWk(fmtNum_(prev && prev['step_' + s.key]) + ' taps'), value: v, display: fmtNum_(v) + ' taps',
-      ratio: base ? firstRatio * (v / base) : 0, color: s === last ? C.ink : app.color, valueColor: C.white,
-      note: fmtPct_(stepConv, 1) + ' of previous step'
+      name: s.label, sub: lastWk((est ? '≈' : '') + fmtNum_(pv)), value: v, display: (est ? '≈' : '') + fmtNum_(v) + ' users',
+      ratio: top ? v / top : 0, color: s === last ? C.ink : app.color, valueColor: C.white,
+      note: fmtPct_(stepConv, 1) + ' of previous step' + (est ? ' (est.)' : '')
     });
     gaps.push([{ text: '▼ ' + fmtPct_(stepConv == null ? null : 100 - stepConv, 1), bold: true, color: C.red },
       { text: ' dropped before "' + s.label + '"', color: C.muted }]);
@@ -250,11 +259,13 @@ function stepFunnelView_(weekly, app, def) {
     subtitle: 'This week ' + formatRange_(cur.start, cur.end),
     steps: steps,
     gaps: gaps,
-    stats: retentionStats_(cmp),
+    // When later steps are estimates, say so where the retention line would go if there is none
+    stats: retentionStats_(cmp) || (anyEstimate ? [{ text: '≈ estimated weekly users: ' + first.label + ' users × ratio of daily counts', color: C.muted }] : null),
+    footnote: anyEstimate ? '≈ = estimated from daily counts (the sheet has no weekly users for this step)' : null,
     callout: {
       label: 'COMPLETION RATE',
       value: cur.completionPct,
-      sub: (last.short || last.label) + ' ÷ ' + (first.short || first.label) + ' (taps)',
+      sub: (last.short || last.label) + ' ÷ ' + (first.short || first.label),
       trendPp: cmp.deltas.completionPct ? cmp.deltas.completionPct.diff : null,
       trendLabel: prev ? 'vs last week (' + fmtPct_(prev.completionPct, 2) + ')' : ''
     }
@@ -367,6 +378,8 @@ function drawStepFunnel_(slide, box, app, view) {
     addRichText_(slide, view.stats, box.x + 10, statsY, callout.x - 22 - box.x, 10, { fontSize: 6, valign: 'MIDDLE' });
   }
 
+  if (view.footnote) addText_(slide, view.footnote, box.x + 10, box.y + 19, 290, 7, { fontSize: 5, color: C.muted });
+
   const c = view.callout;
   rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, callout.x, callout.y, callout.w, callout.h, app.soft);
   addText_(slide, c.label, callout.x + 6, callout.y + 7, callout.w - 12, 8, { fontSize: 5.5, bold: true, color: C.muted, align: 'CENTER' });
@@ -433,7 +446,9 @@ function drawDailyTrend_(slide, box, spec) {
       line.getLineFill().setSolidFill(C.marker);
       line.setWeight(1);
       line.setDashStyle(SlidesApp.DashStyle.DASH);
-      addText_(slide, spec.marker.label, x + 3, box.y + 22, 120, 7, { fontSize: 5.5, bold: true, color: C.marker });
+      // Label on the side of the line with more room
+      const right = x < plot.x + plot.w * 0.6;
+      addText_(slide, spec.marker.label, right ? x + 3 : x - 153, box.y + 22, 150, 7, { fontSize: 5.5, bold: true, color: C.marker, align: right ? 'START' : 'END' });
     }
   }
 

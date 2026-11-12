@@ -32,13 +32,14 @@ function pricingIntelligenceFeature_() {
       const app = CORE.APPS[PI_CONFIG.APP];
       const tag = app.label + ' ';
       const daily = readTable_(ss, PI_CONFIG.SHEET, {
+        // Exact headers first, then patterns so small renames ("Total App DAU", "Weekly App DAU (WAU)") still match
         date: ['date', 'tanggal'],
-        dau: ['app_dau', 'daily_active_users'],
-        feature: ['feature_dau'],
-        newUsers: ['first_time_feature_users', 'new_users'],
-        returningUsers: ['returning_users'],
-        appWau: ['weekly_app_wau', 'app_weekly_active_user'],
-        featureWau: ['weekly_feature_wau', 'feature_weekly_active_user']
+        dau: ['app_dau', 'total_app_dau', 'daily_active_users', /^(total_)?app_dau$/],
+        feature: ['feature_dau', 'total_feature_dau', /^(total_)?feature_dau$/],
+        newUsers: ['first_time_feature_users', 'new_users', /first_time/],
+        returningUsers: ['returning_users', 'existing_returning_feature_users', /returning/],
+        appWau: ['weekly_app_wau', 'weekly_app_dau_wau', 'app_weekly_active_user', /app.*wau$/],
+        featureWau: ['weekly_feature_wau', 'weekly_feature_dau_wau', 'feature_weekly_active_user', /feature.*wau$/]
       }, ['date', 'dau', 'feature']);
       const series = toDailySeries_(daily.rows, ['feature'], tag, issues);
       const weekly = weeklyAnalysis_(series, ['feature'], tag, issues);
@@ -56,13 +57,13 @@ function pricingIntelligenceFeature_() {
           app: app,
           description: 'Shows the latest FFB/TBS buying prices of mills and ramps (partner and non-partner) so users know where to ' +
             'deliver their fruit and at what price today. On ' + formatShortDate_(PI_CONFIG.CHANGE_DATE) + ' the price list moved from a ' +
-            'menu to the home screen, so users now see prices without opening the detail page; detail interactions are expected to drop.',
+            'menu to the home screen, so users now see prices without opening the detail page.',
           scope: [
             'Weekly review of Pricing Intelligence in AgenPRO: this week vs last week (Thursday–Wednesday), the before/after effect ' +
               'of moving the price list to Home, and price coverage: how many mills and ramps update their prices regularly, ' +
               'compared between partner mills, non-partner mills and ramps.',
-            'Do not treat the drop in detail users after the move as a failure by default: prices are now visible on Home without ' +
-              'opening the detail. Recommend product changes that make the Home price list more useful and bring users to the detail when it adds value.'
+            'Describe how detail users changed after the move to Home (prices are now visible on Home without opening the detail), ' +
+              'and recommend product changes that make the Home price list more useful and bring users to the detail when it adds value.'
           ],
           definitions: {
             appWau: 'AgenPRO weekly active users',
@@ -282,7 +283,7 @@ function drawCoveragePanel_(slide, box, cov) {
     const tw = estimateTextWidth_(text, 5) + 2;
     rect_(slide, SlidesApp.ShapeType.RECTANGLE, lx, ly + 2, 6, 6, colorOf(k));
     addText_(slide, text, lx + 8, ly, tw, 10, { fontSize: 5, color: C.muted, valign: 'MIDDLE' });
-    lx += tw + 14;
+    lx += tw + 11;
   });
 
   // Footer: overall coverage and the typical latest price of weekly updaters per segment
