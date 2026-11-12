@@ -404,13 +404,10 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
     };
     stepKeys.forEach((k, idx) => {
       week['step_' + k] = raw.stepTotals[k];
-      if (idx === 0) return;
-      // Distinct users of a later step: from the sheet when given, otherwise estimated from the first step's users and
-      // the ratio of daily counts (daily counts summed are user-days, not distinct users)
-      const fromSheet = raw.stepWau[k];
-      const first = raw.stepTotals[stepKeys[0]];
-      week['users_' + k] = fromSheet != null ? fromSheet : clickUsers != null && first ? Math.round(clickUsers * raw.stepTotals[k] / first) : null;
-      week['usersEstimated_' + k] = fromSheet == null;
+      // Each daily value is already distinct users of that day: average them, never sum them into a weekly "users" figure
+      week['avg_' + k] = raw.days ? round1_(raw.stepTotals[k] / raw.days) : null;
+      // Distinct users of a later step over the week: only when the sheet has a weekly column for it
+      if (idx > 0) week['users_' + k] = raw.stepWau[k] != null ? raw.stepWau[k] : null;
     });
     return week;
   });
@@ -517,7 +514,7 @@ const PLAIN_TERMS = [
   [/\breturningUsers\b/g, 'returning users'], [/\bnewUsers\b/g, 'new users'], [/\btotalDau\b/g, 'total DAU'], [/\bavgDau\b/g, 'average DAU'],
   [/\brepeatInWeek\b/g, 'repeat users'], [/\bvisitsPerUser\b/g, 'visits per user'], [/\bappStickinessPct\b/g, 'app stickiness'],
   [/\bavgFeatureUsers\b/g, 'feature users per day'], [/\bpartnerSharePct\b/g, 'partner share'], [/\bregularPct\b/g, 'regular-update share'],
-  [/\busersEstimated_\w+\b/g, 'estimate'], [/\busers_(\w+)\b/g, '$1 users'], [/\bstep_(\w+)\b/g, '$1 step']
+  [/\bavg_(\w+)\b/g, '$1 users per day'], [/\busers_(\w+)\b/g, '$1 users'], [/\bstep_(\w+)\b/g, '$1 step']
 ];
 
 /** Replaces metric field names in the AI text with plain words. */
