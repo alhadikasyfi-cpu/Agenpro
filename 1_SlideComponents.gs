@@ -52,12 +52,12 @@ function createFunnelFeature_(def) {
             scope: [
               'Weekly review of ' + def.name + ' in ' + app.label + ': this week vs last week (weeks run Thursday–Wednesday).',
               def.steps.length > 1
-                ? 'Explain the funnel (app DAU → ' + def.steps.map(s => s.label).join(' → ') + ', as average distinct users per day), where users drop off, and what changed week over week.'
+                ? 'Explain the funnel (app DAU → ' + def.steps.map(s => s.label).join(' → ') + (def.funnelMode === 'daily' ? ', as average distinct users per day' : '') + '), where users drop off, and what changed week over week.'
                 : 'Explain the funnel (app WAU → users of ' + def.name + ' → returning users) and what changed week over week.'
             ],
             definitions: weeklyDefinitions_(def),
             payload: {
-              weeks: weekly.weeks,
+              weeks: def.funnelMode === 'daily' ? weekly.weeks.map(dropEstimates_) : weekly.weeks,
               thisWeekVsLastWeek: cmp,
               daily: series.filter(r => r.date <= weekly.windows[weekly.windows.length - 1].end).slice(-14)
                 .map(r => Object.assign({ date: r.date, dau: r.dau, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }, r.steps)),
@@ -70,6 +70,16 @@ function createFunnelFeature_(def) {
       });
     }
   };
+}
+
+/** Daily-funnel features show real daily users, so estimated weekly users of later steps are left out of the AI payload. */
+function dropEstimates_(week) {
+  const w = Object.assign({}, week);
+  Object.keys(w).filter(k => k.indexOf('usersEstimated_') === 0 && w[k]).forEach(k => {
+    delete w['users_' + k.slice('usersEstimated_'.length)];
+    delete w[k];
+  });
+  return w;
 }
 
 /** "Lapak Sawit Agenpro" / "Pasar Sawit Timpro" → app key, from the app name at the end of the text. */
@@ -93,12 +103,14 @@ function weeklyDefinitions_(def) {
     appStickinessPct: 'average app DAU ÷ app WAU'
   };
   if (def.steps.length > 1) {
-    def.steps.forEach(s => {
-      d['step_' + s.key] = s.label + ': daily distinct users summed over the week (user-days, NOT users — never quote it as users)';
-      d['avg_' + s.key] = s.label + ': average distinct users per day this week (the funnel on the slide uses these)';
-    });
-    def.steps.slice(1).forEach(s => d['users_' + s.key] = 'distinct users who did "' + s.label + '" this week (null when the sheet has no weekly column)');
-    d.completionPct = def.steps[def.steps.length - 1].label + ' ÷ ' + def.steps[0].label + ' per day';
+    def.steps.forEach(s => d['step_' + s.key] = s.label + ': daily users summed over the week (user-days, not distinct users)');
+    def.steps.slice(1).forEach(s => d['users_' + s.key] = 'distinct users who did "' + s.label + '" this week; ' +
+      'when usersEstimated_' + s.key + ' is true it is an estimate (first-step users × ratio of daily counts) — say "about" when quoting it');
+    if (def.funnelMode === 'daily') {
+      def.steps.forEach(s => d['avg_' + s.key] = s.label + ': average distinct users per day this week (the funnel on the slide uses these; ' +
+        'never call a daily value summed over the week "users")');
+    }
+    d.completionPct = def.steps[def.steps.length - 1].label + ' ÷ ' + def.steps[0].label + ' (daily users summed)';
   }
   return d;
 }
@@ -108,7 +120,7 @@ function drawFunnelFeatureSlide_(slide, def, app, series, weekly, ai, warningCou
   const L = CORE.LAYOUT;
   drawTitle_(slide, L.title, { feature: def.name, app: app, suffix: 'Weekly Review', pill: weekPill_(weekly), warnings: warningCount });
   drawKpiCards_(slide, L.kpi, weeklyKpiCards_(weekly.compare, app, def.usersLabel));
-  drawStepFunnel_(slide, L.main, app, def.steps.length > 1 ? stepFunnelView_(weekly, app, def) : wauFunnelView_(weekly, app, def));
+  drawStepFunnel_(slide, L.main, app, def.steps.length > 1 ? (def.funnelMode === 'daily' ? dailyStepFunnelView_ : stepFunnelView_)(weekly, app, def) : wauFunnelView_(weekly, app, def));
 
   // Daily trend of last week + this week
   const w = weekly.windows;
@@ -216,18 +228,77 @@ function wauFunnelView_(weekly, app, def) {
 }
 
 /**
- * Multi-step feature. When the sheet has weekly distinct users for every later step, the funnel is weekly:
- * app WAU → users of the first step → later steps. Otherwise the funnel is daily: the sheet's own daily distinct users of
- * every step (app DAU → step 1 → step 2 …), averaged over the week. Daily values are never summed into "users".
+ * Multi-step feature: app WAU → distinct users of the first step → later steps. Later steps only have daily counts, so
+ * they are shown as taps this week, with bars scaled from the first step by the step-to-step conversion of those counts.
  */
 function stepFunnelView_(weekly, app, def) {
   const C = CORE.COLORS;
   const cmp = weekly.compare;
   const cur = cmp.current, prev = cmp.previous;
   const lastWk = v => (prev ? 'last wk ' + v : null);
+  const hasWau = cur.appWau != null;
+  const top = hasWau ? cur.appWau : cur.avgDau;
+  const first = def.steps[0], last = def.steps[def.steps.length - 1];
+  const firstRatio = top ? cur.clickUsers / top : 0;
+  const firstConv = hasWau ? cur.conversionPct : cur.ctrPct;
+
+  const steps = [
+    { name: hasWau ? 'Weekly Active Users' : 'App DAU (avg/day)', sub: lastWk(fmtNum_(prev && (hasWau ? prev.appWau : prev.avgDau))),
+      value: top, ratio: 1, color: app.soft, valueColor: app.color, note: hasWau ? 'app users this week' : 'app WAU not in sheet' },
+    { name: first.label, sub: lastWk(fmtNum_(prev && prev.clickUsers)), value: cur.clickUsers, ratio: firstRatio, color: app.color,
+      note: 'users · ' + fmtPct_(firstConv, 2) + ' of ' + (hasWau ? 'WAU' : 'DAU') }
+  ];
+  const gaps = [[{ text: '▼ ' + fmtPct_(firstConv == null ? null : 100 - firstConv, 2), bold: true, color: C.red },
+    { text: ' of ' + (hasWau ? 'app WAU' : 'DAU') + ' did not ' + first.label.toLowerCase() + ' this week', color: C.muted }]];
+
+  let anyEstimate = false;
+  def.steps.slice(1).forEach((s, k) => {
+    const v = cur['users_' + s.key];
+    const est = cur['usersEstimated_' + s.key];
+    anyEstimate = anyEstimate || est;
+    const beforeUsers = k === 0 ? cur.clickUsers : cur['users_' + def.steps[k].key];
+    const stepConv = beforeUsers ? (v / beforeUsers) * 100 : null;
+    const pv = prev ? prev['users_' + s.key] : null;
+    steps.push({
+      name: s.label, sub: lastWk((est ? '≈' : '') + fmtNum_(pv)), value: v, display: (est ? '≈' : '') + fmtNum_(v) + ' users',
+      ratio: top ? v / top : 0, color: s === last ? C.ink : app.color, valueColor: C.white,
+      note: fmtPct_(stepConv, 1) + ' of previous step' + (est ? ' (est.)' : '')
+    });
+    gaps.push([{ text: '▼ ' + fmtPct_(stepConv == null ? null : 100 - stepConv, 1), bold: true, color: C.red },
+      { text: ' dropped before "' + s.label + '"', color: C.muted }]);
+  });
+
+  return {
+    title: 'WEEKLY FUNNEL  ·  ' + [hasWau ? 'WAU' : 'DAU'].concat(def.steps.map(s => s.short || s.label)).join(' → ').toUpperCase(),
+    subtitle: 'This week ' + formatRange_(cur.start, cur.end),
+    steps: steps,
+    gaps: gaps,
+    // When later steps are estimates, say so where the retention line would go if there is none
+    stats: retentionStats_(cmp) || (anyEstimate ? [{ text: '≈ estimated weekly users: ' + first.label + ' users × ratio of daily counts', color: C.muted }] : null),
+    footnote: anyEstimate ? '≈ = estimated from daily counts (the sheet has no weekly users for this step)' : null,
+    callout: {
+      label: 'COMPLETION RATE',
+      value: cur.completionPct,
+      sub: (last.short || last.label) + ' ÷ ' + (first.short || first.label),
+      trendPp: cmp.deltas.completionPct ? cmp.deltas.completionPct.diff : null,
+      trendLabel: prev ? 'vs last week (' + fmtPct_(prev.completionPct, 2) + ')' : ''
+    }
+  };
+}
+
+/**
+ * Daily funnel (def.funnelMode = 'daily'), used when the later steps only have daily distinct users: the sheet's own
+ * daily users of every step (app DAU → step 1 → step 2 …), averaged over the week — never summed. Switches to the weekly
+ * funnel (app WAU → …) once the sheet has weekly distinct users for every later step.
+ */
+function dailyStepFunnelView_(weekly, app, def) {
+  const C = CORE.COLORS;
+  const cmp = weekly.compare;
+  const cur = cmp.current, prev = cmp.previous;
+  const lastWk = v => (prev ? 'last wk ' + v : null);
   const first = def.steps[0], last = def.steps[def.steps.length - 1];
   const later = def.steps.slice(1);
-  const weeklyMode = cur.appWau != null && later.every(s => cur['users_' + s.key] != null);
+  const weeklyMode = cur.appWau != null && later.every(s => cur['users_' + s.key] != null && !cur['usersEstimated_' + s.key]);
 
   const top = weeklyMode ? cur.appWau : cur.avgDau;
   const topPrev = prev ? (weeklyMode ? prev.appWau : prev.avgDau) : null;

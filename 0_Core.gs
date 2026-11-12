@@ -277,10 +277,13 @@ function toDailySeries_(rows, stepKeys, tag, issues) {
     const names = r.names != null ? parseNames_(r.names) : null;
     const newUsers = numOrNull_(r.newUsers), returningUsers = numOrNull_(r.returningUsers);
     if (primary > dau) issues.push(tag + key + ': feature users (' + primary + ') exceed DAU (' + dau + ')');
-    if (newUsers != null && returningUsers != null && newUsers + returningUsers !== primary) note('newReturning', key, newUsers + returningUsers - primary);
-    if (names && names.length && names.length !== primary) note('names', key, names.length - primary);
-    const ids = names ? names.filter(n => /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(n)) : [];
-    if (ids.length) note('ids', key, ids.length);
+    // Small gaps are normal between columns counted by different queries (e.g. a user with no new/returning status, a
+    // user whose name is empty or shared) and do not change the slide: only larger ones are reported
+    const tolerance = Math.max(3, primary * 0.05);
+    const nrDiff = newUsers != null && returningUsers != null ? newUsers + returningUsers - primary : 0;
+    if (Math.abs(nrDiff) > tolerance) note('newReturning', key, nrDiff);
+    const namesDiff = names && names.length ? names.length - primary : 0;
+    if (Math.abs(namesDiff) > tolerance) note('names', key, namesDiff);
     byDate[key] = {
       date: key,
       dau: dau,
@@ -296,17 +299,21 @@ function toDailySeries_(rows, stepKeys, tag, issues) {
   });
   const labels = {
     newReturning: 'new + returning users ≠ feature users',
-    names: 'number of user names ≠ feature users',
-    ids: 'a user ID instead of a name in the user list'
+    names: 'number of user names ≠ feature users'
   };
   Object.keys(tally).forEach(type => {
     const t = tally[type];
-    issues.push(tag + labels[type] + ' on ' + t.days + ' day(s)' + (type === 'ids' ? '' : ', difference up to ' + t.maxDiff) + ' (first: ' + t.first + ')');
+    issues.push(tag + labels[type] + ' on ' + t.days + ' day(s)' + ', difference up to ' + t.maxDiff + ' (first: ' + t.first + ')');
   });
   const series = Object.keys(byDate).sort().map(k => byDate[k]);
   if (series.length) {
-    const span = Math.round((parseDate_(series[series.length - 1].date) - parseDate_(series[0].date)) / 86400000) + 1;
-    if (span > series.length) issues.push(tag + (span - series.length) + ' missing date(s) between ' + series[0].date + ' and ' + series[series.length - 1].date);
+    // Missing dates only matter inside the weeks the slide analyses (older history is not shown)
+    const lastKey = series[series.length - 1].date;
+    const windows = weekWindows_(series[0].date, lastKey);
+    const fromKey = windows.length ? windows[0].start : series[0].date;
+    const missing = [];
+    for (let d = parseDate_(fromKey); dateKey_(d) <= lastKey; d = addDays_(d, 1)) if (!byDate[dateKey_(d)]) missing.push(dateKey_(d));
+    if (missing.length) issues.push(tag + missing.length + ' missing date(s): ' + missing.slice(0, 5).join(', ') + (missing.length > 5 ? ' …' : ''));
   }
   return series;
 }
@@ -325,7 +332,6 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
   const windows = weekWindows_(series[0].date, series[series.length - 1].date);
   if (!windows.length) return null;
   const hasNames = series.some(r => r.names.length);
-  const wauMismatch = [];
 
   const raws = windows.map(w => {
     const rows = series.filter(r => r.date >= w.start && r.date <= w.end);
@@ -349,17 +355,12 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
     const wk = tag + 'week ' + formatRange_(w.start, w.end);
     if (raw.days < 7) issues.push(wk + ': only ' + raw.days + ' of 7 days have data');
     if (raw.appWau == null && raw.days === 7) issues.push(wk + ': app WAU is empty on the last day of the week');
-    const named = Object.keys(nameDays).length;
-    if (hasNames && raw.featureWau != null && named !== raw.featureWau) wauMismatch.push(formatRange_(w.start, w.end) + ': ' + raw.featureWau + ' vs ' + named);
     // Weekly distinct users of later steps, when the sheet has them (filled on the week's last day)
     raw.stepWau = {};
     stepKeys.forEach(k => raw.stepWau[k] = rows.filter(r => r.stepWau[k] != null).map(r => r.stepWau[k]).pop() || null);
     return raw;
   });
 
-  if (wauMismatch.length) {
-    issues.push(tag + 'feature WAU in the sheet ≠ distinct user names in ' + wauMismatch.length + ' week(s) (latest ' + wauMismatch[wauMismatch.length - 1] + ')');
-  }
 
   const seen = {};
   series.filter(r => r.date < windows[0].start).forEach(r => r.names.forEach(n => seen[nameKey_(n)] = true));
@@ -404,10 +405,15 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
     };
     stepKeys.forEach((k, idx) => {
       week['step_' + k] = raw.stepTotals[k];
-      // Each daily value is already distinct users of that day: average them, never sum them into a weekly "users" figure
+      // Each daily value is distinct users of that day: the average per day is a real user count, the sum is not
       week['avg_' + k] = raw.days ? round1_(raw.stepTotals[k] / raw.days) : null;
-      // Distinct users of a later step over the week: only when the sheet has a weekly column for it
-      if (idx > 0) week['users_' + k] = raw.stepWau[k] != null ? raw.stepWau[k] : null;
+      if (idx === 0) return;
+      // Distinct users of a later step: from the sheet when given, otherwise estimated from the first step's users and
+      // the ratio of daily counts (daily counts summed are user-days, not distinct users)
+      const fromSheet = raw.stepWau[k];
+      const first = raw.stepTotals[stepKeys[0]];
+      week['users_' + k] = fromSheet != null ? fromSheet : clickUsers != null && first ? Math.round(clickUsers * raw.stepTotals[k] / first) : null;
+      week['usersEstimated_' + k] = fromSheet == null;
     });
     return week;
   });
@@ -514,7 +520,7 @@ const PLAIN_TERMS = [
   [/\breturningUsers\b/g, 'returning users'], [/\bnewUsers\b/g, 'new users'], [/\btotalDau\b/g, 'total DAU'], [/\bavgDau\b/g, 'average DAU'],
   [/\brepeatInWeek\b/g, 'repeat users'], [/\bvisitsPerUser\b/g, 'visits per user'], [/\bappStickinessPct\b/g, 'app stickiness'],
   [/\bavgFeatureUsers\b/g, 'feature users per day'], [/\bpartnerSharePct\b/g, 'partner share'], [/\bregularPct\b/g, 'regular-update share'],
-  [/\bavg_(\w+)\b/g, '$1 users per day'], [/\busers_(\w+)\b/g, '$1 users'], [/\bstep_(\w+)\b/g, '$1 step']
+  [/\busersEstimated_\w+\b/g, 'estimate'], [/\bavg_(\w+)\b/g, '$1 users per day'], [/\busers_(\w+)\b/g, '$1 users'], [/\bstep_(\w+)\b/g, '$1 step']
 ];
 
 /** Replaces metric field names in the AI text with plain words. */

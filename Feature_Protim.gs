@@ -13,6 +13,8 @@ function protimFeature_() {
       'app. A claim is only possible after the agent has claimed the same delivery first. ' +
       'Funnel: open the Protim menu → tap confirm → confirmation succeeds.',
     app: 'timpro',
+    // Steps 3–4 only have daily distinct users: show the funnel as average users per day, not a weekly sum
+    funnelMode: 'daily',
     fields: {
       date: ['date', 'tanggal'],
       dau: ['app_dau', 'daily_active_users'],
@@ -27,7 +29,7 @@ function protimFeature_() {
     },
     steps: [
       { key: 'menu', label: 'Open Protim menu', short: 'Menu' },
-      // Weekly distinct users of these steps are estimated until the sheet has weekly columns for them
+      // With weekly distinct-user columns for these steps the funnel switches to weekly (app WAU → …)
       { key: 'confirm', label: 'Tap confirm', short: 'Confirm',
         weeklyAliases: ['step3_weekly_users', 'step3_confirmed_weekly_users', 'weekly_step3_users', 'step3_wau'] },
       { key: 'success', label: 'Confirm success', short: 'Success',

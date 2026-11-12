@@ -95,6 +95,7 @@ function readFfbTransactions_(ss, issues) {
   if (at.type < 0 || at.kg < 0) throw new Error('details header must list partner_type and weight_net_kg');
 
   const tx = [];
+  const countGaps = [];
   table.rows.forEach(r => {
     const d = parseDate_(r.date);
     if (!d) {
@@ -120,8 +121,15 @@ function readFfbTransactions_(ss, issues) {
       });
     });
     const expected = r.count != null && r.count !== '' ? toNumber_(r.count) : null;
-    if (expected != null && expected !== items.length) issues.push(date + ': total_transactions ' + expected + ' but ' + items.length + ' in the details');
+    if (expected != null && expected !== items.length) countGaps.push({ date: date, diff: expected - items.length });
   });
+  // One line for all days where total_transactions and the detail list disagree
+  if (countGaps.length) {
+    const missing = countGaps.reduce((a, g) => a + g.diff, 0);
+    issues.push('total_transactions ≠ transactions in the details on ' + countGaps.length + ' day(s) (' +
+      (missing > 0 ? missing + ' transaction(s) have no details, so their tonnage is not counted' : 'difference ' + missing) + '): ' +
+      countGaps.map(g => formatShortDate_(g.date)).join(', '));
+  }
   return tx.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
