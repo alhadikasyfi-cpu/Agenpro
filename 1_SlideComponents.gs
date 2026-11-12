@@ -37,7 +37,6 @@ function createFunnelFeature_(def) {
         const series = toDailySeries_(groups[appKey], stepKeys, tag, issues);
         const weekly = weeklyAnalysis_(series, stepKeys, tag, issues);
         if (!weekly) throw new Error(app.label + ': needs at least one complete week (Thu–Wed) of data');
-        if (weekly.daysInProgress) issues.push(tag + weekly.daysInProgress + ' day(s) of the current week wait until the week is complete');
         const title = def.name + ' · ' + app.label;
         const cmp = weekly.compare;
         return {
@@ -154,10 +153,10 @@ function weeklyKpiCards_(cmp, app, usersLabel) {
       : { label: app.label.toUpperCase() + ' · APP WAU', value: '–', sub: '⚠ not in sheet · avg DAU ' + fmtNum_(cur.avgDau) + '/day', subColor: C.amber, accent: C.blue },
     Object.assign({ label: usersLabel, value: fmtNum_(cur.clickUsers), accent: app.color }, sub('clickUsers', fmtNum_(prev && prev.clickUsers))),
     hasWau
-      ? Object.assign({ label: 'CONVERSION · WAU → FEATURE', value: fmtPct_(cur.conversionPct, 2), accent: C.greenBar }, sub('conversionPct', fmtPct_(prev && prev.conversionPct, 2)))
+      ? Object.assign({ label: 'WAU → FEATURE', value: fmtPct_(cur.conversionPct, 2), accent: C.greenBar }, sub('conversionPct', fmtPct_(prev && prev.conversionPct, 2)))
       : Object.assign({ label: 'CTR · VISITS ÷ DAU', value: fmtPct_(cur.ctrPct, 2), accent: C.greenBar }, sub('ctrPct', fmtPct_(prev && prev.ctrPct, 2))),
     prev && cur.retainedFromPrev != null ? {
-      label: 'RETAINED FROM LAST WEEK',
+      label: 'RETAINED FROM LAST WK',
       value: fmtPct_(cur.retentionPct, 0),
       sub: fmtNum_(cur.retainedFromPrev) + ' of ' + fmtNum_(cur.prevClickUsers) + ' last-week users came back',
       accent: C.returning
@@ -208,39 +207,54 @@ function wauFunnelView_(weekly, app, def) {
   };
 }
 
-/** Multi-step feature: weekly totals (daily counts summed) from app DAU through every step, with step conversion. */
+/**
+ * Multi-step feature: app WAU → distinct users of the first step → later steps. Later steps only have daily counts, so
+ * they are shown as taps this week, with bars scaled from the first step by the step-to-step conversion of those counts.
+ */
 function stepFunnelView_(weekly, app, def) {
   const C = CORE.COLORS;
   const cmp = weekly.compare;
   const cur = cmp.current, prev = cmp.previous;
   const lastWk = v => (prev ? 'last wk ' + v : null);
-  const total = cur.totalDau;
-  const steps = [{ name: 'App DAU (7 days)', sub: lastWk(fmtNum_(prev && prev.totalDau)), value: total, ratio: 1, color: app.soft, valueColor: app.color, note: 'daily users summed' }];
-  def.steps.forEach((s, i) => {
-    const v = cur['step_' + s.key];
-    const before = i === 0 ? total : cur['step_' + def.steps[i - 1].key];
-    steps.push({
-      name: s.label, sub: lastWk(fmtNum_(prev && prev['step_' + s.key])), value: v,
-      ratio: total ? v / total : 0, color: i === def.steps.length - 1 ? C.ink : app.color, valueColor: C.white,
-      note: fmtPct_(before ? (v / before) * 100 : null, 1) + ' of previous step'
-    });
-  });
-  const gaps = def.steps.map((s, i) => {
-    const before = i === 0 ? total : cur['step_' + def.steps[i - 1].key];
-    const v = cur['step_' + s.key];
-    return [{ text: '▼ ' + fmtPct_(before ? 100 - (v / before) * 100 : null, 1), bold: true, color: C.red }, { text: ' dropped before "' + s.label + '"', color: C.muted }];
-  });
+  const hasWau = cur.appWau != null;
+  const top = hasWau ? cur.appWau : cur.avgDau;
   const first = def.steps[0], last = def.steps[def.steps.length - 1];
+  const firstRatio = top ? cur.clickUsers / top : 0;
+  const firstConv = hasWau ? cur.conversionPct : cur.ctrPct;
+
+  const steps = [
+    { name: hasWau ? 'Weekly Active Users' : 'App DAU (avg/day)', sub: lastWk(fmtNum_(prev && (hasWau ? prev.appWau : prev.avgDau))),
+      value: top, ratio: 1, color: app.soft, valueColor: app.color, note: hasWau ? 'app users this week' : 'app WAU not in sheet' },
+    { name: first.label, sub: lastWk(fmtNum_(prev && prev.clickUsers)), value: cur.clickUsers, ratio: firstRatio, color: app.color,
+      note: 'users · ' + fmtPct_(firstConv, 2) + ' of ' + (hasWau ? 'WAU' : 'DAU') }
+  ];
+  const gaps = [[{ text: '▼ ' + fmtPct_(firstConv == null ? null : 100 - firstConv, 2), bold: true, color: C.red },
+    { text: ' of ' + (hasWau ? 'app WAU' : 'DAU') + ' did not ' + first.label.toLowerCase() + ' this week', color: C.muted }]];
+
+  const base = cur['step_' + first.key];
+  def.steps.slice(1).forEach((s, k) => {
+    const v = cur['step_' + s.key];
+    const before = cur['step_' + def.steps[k].key];
+    const stepConv = before ? (v / before) * 100 : null;
+    steps.push({
+      name: s.label, sub: lastWk(fmtNum_(prev && prev['step_' + s.key]) + ' taps'), value: v, display: fmtNum_(v) + ' taps',
+      ratio: base ? firstRatio * (v / base) : 0, color: s === last ? C.ink : app.color, valueColor: C.white,
+      note: fmtPct_(stepConv, 1) + ' of previous step'
+    });
+    gaps.push([{ text: '▼ ' + fmtPct_(stepConv == null ? null : 100 - stepConv, 1), bold: true, color: C.red },
+      { text: ' dropped before "' + s.label + '"', color: C.muted }]);
+  });
+
   return {
-    title: 'WEEKLY FUNNEL  ·  ' + ['DAU'].concat(def.steps.map(s => s.short || s.label)).join(' → ').toUpperCase(),
-    subtitle: 'Weekly totals · ' + formatRange_(cur.start, cur.end),
+    title: 'WEEKLY FUNNEL  ·  ' + [hasWau ? 'WAU' : 'DAU'].concat(def.steps.map(s => s.short || s.label)).join(' → ').toUpperCase(),
+    subtitle: 'This week ' + formatRange_(cur.start, cur.end),
     steps: steps,
     gaps: gaps,
     stats: retentionStats_(cmp),
     callout: {
       label: 'COMPLETION RATE',
       value: cur.completionPct,
-      sub: (last.short || last.label) + ' ÷ ' + (first.short || first.label),
+      sub: (last.short || last.label) + ' ÷ ' + (first.short || first.label) + ' (taps)',
       trendPp: cmp.deltas.completionPct ? cmp.deltas.completionPct.diff : null,
       trendLabel: prev ? 'vs last week (' + fmtPct_(prev.completionPct, 2) + ')' : ''
     }
@@ -331,11 +345,11 @@ function drawStepFunnel_(slide, box, app, view) {
     const fillW = st.value > 0 ? Math.max(4, col.trackW * Math.min(1, st.ratio)) : 0;
     if (fillW) rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, col.track, cy - barH / 2, fillW, barH, st.color);
     if (fillW >= 40) {
-      addText_(slide, fmtNum_(st.value, 1), col.track, y, fillW - 6, rowH, { fontSize: 7, bold: true, color: st.valueColor || C.white, align: 'END', valign: 'MIDDLE' });
+      addText_(slide, st.display || fmtNum_(st.value, 1), col.track, y, fillW - 6, rowH, { fontSize: 7, bold: true, color: st.valueColor || C.white, align: 'END', valign: 'MIDDLE' });
       if (st.note && fillW < col.trackW - 60) addText_(slide, st.note, col.track + fillW + 5, y, col.trackW - fillW - 5, rowH, { fontSize: 6, color: C.muted, valign: 'MIDDLE' });
     } else {
       const ox = col.track + fillW + 5;
-      addRichText_(slide, [{ text: fmtNum_(st.value, 1), bold: true, color: C.ink }, { text: '  ·  ' + st.note, color: C.muted }],
+      addRichText_(slide, [{ text: st.display || fmtNum_(st.value, 1), bold: true, color: C.ink }, { text: (st.display ? '  ·  ' : ' ') + st.note, color: C.muted }],
         ox, y, col.track + col.trackW - ox, rowH, { fontSize: 6.5, valign: 'MIDDLE' });
     }
   });
@@ -611,7 +625,8 @@ function drawKpiCard_(slide, x, y, w, h, card) {
   rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, x, y, w, h, C.cardBg, C.border);
   rect_(slide, SlidesApp.ShapeType.RECTANGLE, x, y + 7, 3, h - 14, card.accent);
 
-  const labelSize = fitFontSize_([card.label], w - 14, 8, 6, 5, 0, true);
+  // Labels are in capitals, which run wider than the average glyph width used by the estimate
+  const labelSize = fitFontSize_([card.label], (w - 14) * 0.8, 8, 6, 4.5, 0, true);
   addText_(slide, card.label, x + 10, y + 5, w - 14, 8, { fontSize: labelSize, bold: true, color: C.muted });
   addText_(slide, card.value, x + 10, y + 14, w - 14, 16, { fontSize: 15, bold: true, color: C.ink, valign: 'MIDDLE' });
   const subSize = fitFontSize_([card.sub], w - 14, 7, 5.5, 4.5, 0);

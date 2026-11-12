@@ -31,7 +31,7 @@ const CORE = {
   TEXT_INSET_X: 7.2,
   TEXT_INSET_Y: 3.6,
   // Average Arial glyph width as a fraction of font size; used to estimate wrapping and auto-fit text.
-  CHAR_WIDTH: 0.52,
+  CHAR_WIDTH: 0.56,
   LINE_HEIGHT: 1.2,
 
   // Design tokens aligned with SawitPRO branding
@@ -475,7 +475,29 @@ function callGeminiAll_(specs) {
     });
     pending = retry;
   }
-  return results.map((ai, i) => removeOffTopic_(ai, specs[i].ai));
+  return results.map((ai, i) => plainTerms_(removeOffTopic_(ai, specs[i].ai)));
+}
+
+// Metric field names Gemini sometimes copies from DATA, and the words to show instead
+const PLAIN_TERMS = [
+  [/\bclickUsers\b/g, 'feature users'], [/\bprevClickUsers\b/g, 'last week\'s feature users'], [/\bcompletionPct\b/g, 'completion rate'],
+  [/\bconversionPct\b/g, 'WAU-to-feature conversion'], [/\bctrPct\b/g, 'CTR'], [/\bappWau\b/g, 'app WAU'], [/\bfeatureWau\b/g, 'feature users'],
+  [/\bretainedFromPrev\b/g, 'retained users'], [/\bretentionPct\b/g, 'retention'], [/\bchurnedFromPrev\b/g, 'users who did not return'],
+  [/\breturningUsers\b/g, 'returning users'], [/\bnewUsers\b/g, 'new users'], [/\btotalDau\b/g, 'total DAU'], [/\bavgDau\b/g, 'average DAU'],
+  [/\brepeatInWeek\b/g, 'repeat users'], [/\bvisitsPerUser\b/g, 'visits per user'], [/\bappStickinessPct\b/g, 'app stickiness'],
+  [/\bavgFeatureUsers\b/g, 'feature users per day'], [/\bpartnerSharePct\b/g, 'partner share'], [/\bregularPct\b/g, 'regular-update share'],
+  [/\bstep_(\w+)\b/g, '$1 step']
+];
+
+/** Replaces metric field names in the AI text with plain words. */
+function plainTerms_(ai) {
+  const fix = t => PLAIN_TERMS.reduce((acc, p) => acc.replace(p[0], p[1]), String(t || ''));
+  return Object.assign({}, ai, {
+    headline: fix(ai.headline),
+    observations: ai.observations.map(fix),
+    nextSteps: ai.nextSteps.map(s => ({ action: fix(s.action), pic: s.pic })),
+    speakerNotes: fix(ai.speakerNotes)
+  });
 }
 
 function buildGeminiPrompt_(a) {

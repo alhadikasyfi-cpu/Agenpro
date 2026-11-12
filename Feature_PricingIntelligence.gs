@@ -43,7 +43,6 @@ function pricingIntelligenceFeature_() {
       const series = toDailySeries_(daily.rows, ['feature'], tag, issues);
       const weekly = weeklyAnalysis_(series, ['feature'], tag, issues);
       if (!weekly) throw new Error('needs at least one complete week (Thu–Wed) of data');
-      if (weekly.daysInProgress) issues.push(tag + weekly.daysInProgress + ' day(s) of the current week wait until the week is complete');
 
       const coverage = readCoverage_(ss, issues);
       const change = beforeAfter_(series, PI_CONFIG.CHANGE_DATE);

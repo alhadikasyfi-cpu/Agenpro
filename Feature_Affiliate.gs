@@ -27,7 +27,7 @@ function affiliateFeature_() {
       { key: 'dashboard', label: 'Open affiliate dashboard', short: 'Dashboard' },
       { key: 'share', label: 'Share affiliate link', short: 'Share link' }
     ],
-    usersLabel: 'USERS OPEN AFFILIATE DASHBOARD'
+    usersLabel: 'USERS OPEN DASHBOARD'
   });
 }
 
