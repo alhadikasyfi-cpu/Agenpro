@@ -77,9 +77,10 @@ function pricingIntelligenceFeature_() {
           payload: {
             weeks: weekly.weeks,
             thisWeekVsLastWeek: cmp,
+            estimatedDay: weekly.estimatedDay,
             beforeAfter: change,
             coverage: coverage,
-            daily: series.map(r => ({ date: r.date, dau: r.dau, detailUsers: r.steps.feature, firstTime: r.newUsers, returning: r.returningUsers })),
+            daily: series.map(r => ({ date: r.date, estimated: r.estimated || undefined, dau: r.dau, detailUsers: r.steps.feature, firstTime: r.newUsers, returning: r.returningUsers })),
             dataQualityIssues: issues.slice()
           },
           fallbackHeadline: title + ': ' + fmtNum_(cmp.current.clickUsers) + ' detail users this week.'
@@ -189,7 +190,7 @@ function beforeAfter_(series, changeKey) {
 
 function drawPricingSlide_(slide, app, series, weekly, change, coverage, ai, warningCount) {
   const C = CORE.COLORS, L = CORE.LAYOUT;
-  drawTitle_(slide, L.title, { feature: 'Pricing Intelligence', app: app, suffix: 'Weekly Review', pill: weekPill_(weekly), warnings: warningCount });
+  drawTitle_(slide, L.title, { feature: 'Pricing Intelligence', app: app, suffix: 'Weekly Review', pill: weekPill_(weekly), warnings: warningCount, estimatedDay: weekly.estimatedDay });
 
   const cards = weeklyKpiCards_(weekly.compare, app, 'USERS OPEN PRICE DETAIL').slice(0, 2);
   const b = change.before, a = change.after;
@@ -215,7 +216,7 @@ function drawPricingSlide_(slide, app, series, weekly, change, coverage, ai, war
   drawDailyTrend_(slide, L.chart, {
     title: 'DAILY TREND · ' + app.label.toUpperCase(),
     rows: series.filter(r => r.date <= weekly.windows[weekly.windows.length - 1].end).map(r => ({
-      date: r.date, line: r.dau,
+      date: r.date, estimated: r.estimated, line: r.dau,
       segs: r.newUsers != null && r.returningUsers != null ? [[r.newUsers, app.color], [r.returningUsers, C.returning]] : [[r.steps.feature, app.color]],
       total: r.steps.feature, pct: r.ctrPct
     })),

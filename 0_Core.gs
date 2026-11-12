@@ -19,6 +19,10 @@ const CORE = {
   // Only complete weeks are compared; days of a week still in progress wait for the next run.
   WEEK_START_DAY: 4,
   MAX_WEEKS: 8,
+  // When the sheet stops one day before the week ends (e.g. Tuesday, Wednesday not loaded yet), estimate that last day so
+  // the report covers the full week. The estimate is labelled on the slide and in the AI text.
+  ESTIMATE_MISSING_LAST_DAY: true,
+  ESTIMATE_LOOKBACK_WEEKS: 4,
   // Extra Gemini rounds asking it to rewrite an answer that breaks the feature-only or PM-action rules
   GEMINI_MAX_RETRIES: 2,
   // Action items must be things a Product Manager ships or launches, not analysis work for a data analyst
@@ -329,6 +333,7 @@ const WEEK_METRIC_KINDS = { conversionPct: 'pct', ctrPct: 'pct', retentionPct: '
  */
 function weeklyAnalysis_(series, stepKeys, tag, issues) {
   if (!series.length) return null;
+  const estimate = estimateMissingLastDay_(series, stepKeys);
   const windows = weekWindows_(series[0].date, series[series.length - 1].date);
   if (!windows.length) return null;
   const hasNames = series.some(r => r.names.length);
@@ -371,7 +376,9 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
     let newUsers = raw.newFromSheet;
     if (newUsers == null && names) newUsers = names.filter(k => !seen[k]).length;
     const prevNamed = prev && names ? Object.keys(prev.nameDays).length : null;
-    const retained = prev && names ? names.filter(k => prev.nameDays[k]).length : null;
+    let retained = prev && names ? names.filter(k => prev.nameDays[k]).length : null;
+    // The estimated day has no names: scale "came back" by how much the week's last day added in earlier weeks
+    if (estimate && raw.end === estimate.weekEnd && retained != null) retained = Math.min(prevNamed, Math.round(retained * estimate.retainedScale));
     const returning = clickUsers != null && newUsers != null ? Math.max(0, clickUsers - newUsers) : null;
     if (names) names.forEach(k => seen[k] = true);
     const visits = raw.stepTotals[stepKeys[0]];
@@ -380,6 +387,7 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
       start: raw.start,
       end: raw.end,
       days: raw.days,
+      estimatedDay: estimate && raw.end === estimate.weekEnd ? estimate.date : null,
       appWau: raw.appWau,
       clickUsers: clickUsers,
       conversionPct: raw.appWau && clickUsers != null ? round2_((clickUsers / raw.appWau) * 100) : null,
@@ -422,12 +430,98 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
   return {
     windows: windows,
     weeks: weeks,
+    estimatedDay: estimate ? estimate.date : null,
     compare: compareWeeks_(weeks),
     daysInProgress: series.filter(r => r.date > lastFull).length
   };
 }
 
 /** Complete weeks, oldest first, from WEEK_START_DAY; the latest one ends on or before lastKey. */
+/**
+ * If the series ends exactly one day before a week's last day, adds an estimated row for that day (in place) so the week
+ * is complete. Daily values = average of the same weekday in the previous weeks. Weekly app / feature WAU = this week's
+ * first six days scaled by how the full-week WAU related to the first six days in earlier weeks. The row has no user
+ * names; `retainedScale` does the same for "came back from last week". Returns null when nothing is estimated.
+ */
+function estimateMissingLastDay_(series, stepKeys) {
+  if (!CORE.ESTIMATE_MISSING_LAST_DAY || series.length < 8) return null;
+  const lastKey = series[series.length - 1].date;
+  const target = addDays_(parseDate_(lastKey), 1);
+  if (target.getDay() !== (CORE.WEEK_START_DAY + 6) % 7) return null;
+  const date = dateKey_(target);
+  const byDate = {};
+  series.forEach(r => byDate[r.date] = r);
+  const lookback = [];
+  for (let k = 1; k <= CORE.ESTIMATE_LOOKBACK_WEEKS; k++) {
+    const end = dateKey_(addDays_(target, -7 * k));
+    if (byDate[end]) lookback.push(end);
+  }
+  if (!lookback.length) return null;
+
+  const mean = list => (list.length ? list.reduce((a, v) => a + v, 0) / list.length : null);
+  const sameDay = get => {
+    const vals = lookback.map(d => get(byDate[d])).filter(v => v != null);
+    return vals.length ? Math.round(mean(vals)) : null;
+  };
+  const daysOf = (endKey, n) => {
+    const out = [];
+    for (let i = 6; i > 6 - n; i--) { const r = byDate[dateKey_(addDays_(parseDate_(endKey), -i))]; if (r) out.push(r); }
+    return out;
+  };
+  const distinct = rows => {
+    const set = {};
+    rows.forEach(r => r.names.forEach(n => set[nameKey_(n)] = true));
+    return set;
+  };
+  // Ratio "full week ÷ first six days" in earlier weeks, applied to this week's first six days
+  const ratio = (fullOf, sixOf) => mean(lookback.map(end => {
+    const full = fullOf(end), six = sixOf(end);
+    return full != null && six ? full / six : null;
+  }).filter(v => v != null));
+
+  const six = daysOf(date, 6);
+  const sumDau = rows => rows.reduce((a, r) => a + r.dau, 0);
+  const hasNames = series.some(r => r.names.length);
+  const steps = {};
+  stepKeys.forEach(k => steps[k] = sameDay(r => r.steps[k]) || 0);
+  const row = {
+    date: date,
+    estimated: true,
+    dau: sameDay(r => r.dau) || 0,
+    steps: steps,
+    newUsers: sameDay(r => r.newUsers),
+    returningUsers: sameDay(r => r.returningUsers),
+    names: [],
+    stepWau: {},
+    appWau: null,
+    featureWau: null
+  };
+  row.ctrPct = row.dau > 0 ? round2_((steps[stepKeys[0]] / row.dau) * 100) : null;
+  const appRatio = ratio(end => byDate[end].appWau, end => sumDau(daysOf(end, 6)));
+  if (appRatio) row.appWau = Math.round(appRatio * sumDau(six));
+  const firstStepSum = rows => rows.reduce((a, r) => a + r.steps[stepKeys[0]], 0);
+  const featRatio = hasNames
+    ? ratio(end => byDate[end].featureWau, end => Object.keys(distinct(daysOf(end, 6))).length)
+    : ratio(end => byDate[end].featureWau, end => firstStepSum(daysOf(end, 6)));
+  if (featRatio) row.featureWau = Math.round(featRatio * (hasNames ? Object.keys(distinct(six)).length : firstStepSum(six)));
+  stepKeys.forEach(k => {
+    const r = ratio(end => byDate[end].stepWau && byDate[end].stepWau[k], end => daysOf(end, 6).reduce((a, x) => a + x.steps[k], 0));
+    row.stepWau[k] = r ? Math.round(r * six.reduce((a, x) => a + x.steps[k], 0)) : null;
+  });
+
+  // "Came back from last week": users of the previous week seen on all seven days vs the first six days
+  const retainedScale = hasNames ? ratio(end => {
+    const prevSet = distinct(daysOf(dateKey_(addDays_(parseDate_(end), -7)), 7));
+    return Object.keys(distinct(daysOf(end, 7))).filter(k => prevSet[k]).length;
+  }, end => {
+    const prevSet = distinct(daysOf(dateKey_(addDays_(parseDate_(end), -7)), 7));
+    return Object.keys(distinct(daysOf(end, 6))).filter(k => prevSet[k]).length;
+  }) || 1 : 1;
+
+  series.push(row);
+  return { date: date, weekEnd: date, retainedScale: retainedScale };
+}
+
 function weekWindows_(firstKey, lastKey) {
   const first = parseDate_(firstKey);
   let last = parseDate_(lastKey);
@@ -563,6 +657,10 @@ function buildGeminiPrompt_(a) {
     '- Ground every statement in DATA and quote numbers exactly as given; when comparing periods, quote both numbers.',
     '- Use plain business language. Never write JSON field names; write dates like "22 Oct".',
     '- "WAU" always means the APP\'s weekly active users (appWau). Never call the feature\'s users "WAU".',
+    a.payload && a.payload.estimatedDay
+      ? '- ' + a.payload.estimatedDay + ' (the last day of this week) is not in the sheet yet; its numbers and this week\'s WAU are ' +
+        'ESTIMATES. Say once that this week is partly estimated; do not build conclusions on that day alone.'
+      : '',
     '- If only one or two periods can be compared, say trends are early signals.',
     '- If dataQualityIssues is not empty, mention the most important one in an observation.'
   ].concat(a.extraRules || []).concat([

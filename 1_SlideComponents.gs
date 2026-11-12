@@ -59,8 +59,9 @@ function createFunnelFeature_(def) {
             payload: {
               weeks: def.funnelMode === 'daily' ? weekly.weeks.map(dropEstimates_) : weekly.weeks,
               thisWeekVsLastWeek: cmp,
+              estimatedDay: weekly.estimatedDay,
               daily: series.filter(r => r.date <= weekly.windows[weekly.windows.length - 1].end).slice(-14)
-                .map(r => Object.assign({ date: r.date, dau: r.dau, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }, r.steps)),
+                .map(r => Object.assign({ date: r.date, estimated: r.estimated || undefined, dau: r.dau, newUsers: r.newUsers, returningUsers: r.returningUsers, ctrPct: r.ctrPct }, r.steps)),
               dataQualityIssues: issues.filter(i => i.indexOf(tag) === 0)
             },
             fallbackHeadline: title + ': ' + fmtNum_(cmp.current.clickUsers) + ' users this week.'
@@ -118,7 +119,7 @@ function weeklyDefinitions_(def) {
 /** Weekly slide for one app of a funnel feature. */
 function drawFunnelFeatureSlide_(slide, def, app, series, weekly, ai, warningCount) {
   const L = CORE.LAYOUT;
-  drawTitle_(slide, L.title, { feature: def.name, app: app, suffix: 'Weekly Review', pill: weekPill_(weekly), warnings: warningCount });
+  drawTitle_(slide, L.title, { feature: def.name, app: app, suffix: 'Weekly Review', pill: weekPill_(weekly), warnings: warningCount, estimatedDay: weekly.estimatedDay });
   drawKpiCards_(slide, L.kpi, weeklyKpiCards_(weekly.compare, app, def.usersLabel));
   drawStepFunnel_(slide, L.main, app, def.steps.length > 1 ? (def.funnelMode === 'daily' ? dailyStepFunnelView_ : stepFunnelView_)(weekly, app, def) : wauFunnelView_(weekly, app, def));
 
@@ -133,6 +134,7 @@ function drawFunnelFeatureSlide_(slide, def, app, series, weekly, ai, warningCou
     title: 'DAILY TREND · ' + app.label.toUpperCase(),
     rows: rows.map(r => ({
       date: r.date,
+      estimated: r.estimated,
       line: r.dau,
       segs: hasSplit ? [[r.newUsers, app.color], [r.returningUsers, C.returning]] : [[r.steps[def.steps[0].key], app.color]],
       total: r.steps[def.steps[0].key],
@@ -154,7 +156,7 @@ function drawFunnelFeatureSlide_(slide, def, app, series, weekly, ai, warningCou
 function weekPill_(weekly) {
   const w = weekly.windows;
   const cur = w[w.length - 1], prev = w.length > 1 ? w[w.length - 2] : null;
-  return 'THIS WEEK  ' + formatRange_(cur.start, cur.end) + (prev ? '   vs   ' + formatRange_(prev.start, prev.end) : '');
+  return 'THIS WEEK  ' + formatRange_(cur.start, cur.end) + (weekly.estimatedDay ? '*' : '') + (prev ? '   vs   ' + formatRange_(prev.start, prev.end) : '');
 }
 
 /** KPI cards: app WAU, users of the feature, WAU → feature conversion (or CTR), retained from last week. */
@@ -375,10 +377,18 @@ function drawTitle_(slide, box, t) {
   const pillW = estimateTextWidth_(t.pill, 6.5, true) + 18;
   const pillX = box.x + box.w - pillW;
   pill_(slide, t.pill, pillX, box.y + 2, pillW, 14, C.greenSoft, C.greenDark, 6.5);
+  // Estimated last day: amber note left of the pill (and left of the warning text, when both)
+  let noteRight = pillX - 8;
+  if (t.estimatedDay) {
+    const est = '* ' + formatShortDate_(t.estimatedDay) + ' estimated — not in the sheet yet';
+    const estW = estimateTextWidth_(est, 6, true) + 4;
+    addText_(slide, est, noteRight - estW, box.y + 2, estW, 14, { fontSize: 6, bold: true, color: CORE.COLORS.returning, align: 'END', valign: 'MIDDLE' });
+    noteRight -= estW + 8;
+  }
   if (t.warnings) {
     const warn = '⚠ ' + t.warnings + ' data warning' + (t.warnings > 1 ? 's' : '') + ' — see Run Log';
     const warnW = estimateTextWidth_(warn, 6, true) + 4;
-    addText_(slide, warn, pillX - warnW - 8, box.y + 2, warnW, 14, { fontSize: 6, bold: true, color: C.red, align: 'END', valign: 'MIDDLE' });
+    addText_(slide, warn, noteRight - warnW, box.y + 2, warnW, 14, { fontSize: 6, bold: true, color: C.red, align: 'END', valign: 'MIDDLE' });
   }
 }
 
@@ -545,6 +555,13 @@ function drawDailyTrend_(slide, box, spec) {
   const base = plot.y + plot.h;
   rows.forEach((r, i) => {
     let y = base;
+    // Estimated day: dashed outline instead of filled bars
+    if (r.estimated) {
+      const h = ((r.total || 0) / maxBar) * plot.h;
+      if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, px(i) - barW / 2, base - h, barW, h, C.white, C.returning, 1).getBorder().setDashStyle(SlidesApp.DashStyle.DASH);
+      if (detailed) addText_(slide, fmtNum_(r.total), px(i) - 15, base - h - 9, 30, 8, { fontSize: 5.5, bold: true, color: C.returning, align: 'CENTER', valign: 'MIDDLE' });
+      return;
+    }
     r.segs.forEach(sg => {
       const h = ((sg[0] || 0) / maxBar) * plot.h;
       if (h >= 0.5) rect_(slide, SlidesApp.ShapeType.RECTANGLE, px(i) - barW / 2, y - h, barW, h, sg[1]);
@@ -578,7 +595,7 @@ function drawDailyTrend_(slide, box, spec) {
     labelIdx.push(n - 1);
   }
   labelIdx.forEach(i => {
-    const parts = [{ text: formatShortDate_(rows[i].date), color: C.muted }];
+    const parts = [{ text: formatShortDate_(rows[i].date) + (rows[i].estimated ? '*' : ''), color: rows[i].estimated ? C.returning : C.muted, bold: !!rows[i].estimated }];
     if (detailed && rows[i].pct != null) parts.push({ text: '\n' + fmtPct_(rows[i].pct, 2), color: C.greenDark, bold: true });
     addRichText_(slide, parts, px(i) - 22, plot.y + plot.h + 3, 44, detailed ? 16 : 8, { fontSize: 5.5, align: 'CENTER' });
   });

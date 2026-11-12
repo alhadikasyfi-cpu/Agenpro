@@ -59,6 +59,7 @@ function ffbTransactionFeature_() {
             previousMonth: prev,
             months: months,
             weeks: weekly,
+            estimatedDay: weekly.length && weekly[weekly.length - 1].estimatedDay || null,
             dataQualityIssues: issues.slice()
           },
           fallbackHeadline: title + ': ' + fmtTonnes_(report.total.kg) + ' delivered in ' + monthLabel_(report.month) + '.'
@@ -191,13 +192,34 @@ function monthLabel_(key) {
 
 /** Complete Thursday–Wednesday weeks: kg and transactions per type. */
 function weeklyFfb_(tx) {
-  return weekWindows_(tx[0].date, tx[tx.length - 1].date).map(w => {
+  // Sheet stops one day before the week ends: estimate that day per type from the same weekday of earlier weeks
+  let est = null;
+  const lastKey = tx[tx.length - 1].date;
+  const target = addDays_(parseDate_(lastKey), 1);
+  if (CORE.ESTIMATE_MISSING_LAST_DAY && target.getDay() === (CORE.WEEK_START_DAY + 6) % 7) {
+    const days = [];
+    for (let k = 1; k <= CORE.ESTIMATE_LOOKBACK_WEEKS; k++) {
+      const d = dateKey_(addDays_(target, -7 * k));
+      if (d >= tx[0].date) days.push(d);
+    }
+    if (days.length) {
+      est = { date: dateKey_(target) };
+      FFB_CONFIG.TYPES.forEach(type => {
+        const list = tx.filter(t => t.type === type && days.indexOf(t.date) >= 0);
+        est[type] = { kg: Math.round(list.reduce((a, t) => a + t.kg, 0) / days.length), tx: Math.round(list.length / days.length) };
+      });
+    }
+  }
+  return weekWindows_(tx[0].date, est ? est.date : lastKey).map(w => {
     const list = tx.filter(t => t.date >= w.start && t.date <= w.end);
-    const out = { start: w.start, end: w.end, totalKg: Math.round(list.reduce((a, t) => a + t.kg, 0)) };
+    const out = { start: w.start, end: w.end };
+    const isEst = est && w.end === est.date;
+    if (isEst) out.estimatedDay = est.date;
     FFB_CONFIG.TYPES.forEach(type => {
       const g = list.filter(t => t.type === type);
-      out[type] = { kg: Math.round(g.reduce((a, t) => a + t.kg, 0)), tx: g.length };
+      out[type] = { kg: Math.round(g.reduce((a, t) => a + t.kg, 0)) + (isEst ? est[type].kg : 0), tx: g.length + (isEst ? est[type].tx : 0) };
     });
+    out.totalKg = FFB_CONFIG.TYPES.reduce((a, type) => a + out[type].kg, 0);
     out.partnerSharePct = out.totalKg ? round1_((out.PARTNER.kg / out.totalKg) * 100) : null;
     return out;
   });
@@ -312,6 +334,11 @@ function drawFfbWeeklyChart_(slide, box, weeks) {
   const C = CORE.COLORS;
   panel_(slide, box);
   sectionTitle_(slide, 'WEEKLY TONNAGE TREND (THU–WED)', box.x + 10, box.y + 8, 200);
+  const estWeek = weeks.length ? weeks[weeks.length - 1].estimatedDay : null;
+  if (estWeek) {
+    addText_(slide, '* ' + formatShortDate_(estWeek) + ' estimated — not in the sheet yet', box.x + 10, box.y + 19, 200, 8,
+      { fontSize: 5.5, bold: true, color: C.returning, valign: 'MIDDLE' });
+  }
   let lx = box.x + box.w - 10;
   [['Non-partner', C.nonPartner], ['Partner', C.greenDark]].forEach(item => {
     const tw = estimateTextWidth_(item[0], 6) + 3;
@@ -343,7 +370,7 @@ function drawFfbWeeklyChart_(slide, box, weeks) {
     });
     addText_(slide, fmtTonnes_(w.totalKg), cx - band / 2, y - 9, band, 8, { fontSize: 5.5, bold: true, color: C.ink, align: 'CENTER', valign: 'MIDDLE' });
     addRichText_(slide, [
-      { text: formatRange_(w.start, w.end), color: C.muted },
+      { text: formatRange_(w.start, w.end) + (w.estimatedDay ? '*' : ''), color: w.estimatedDay ? C.returning : C.muted, bold: !!w.estimatedDay },
       { text: '\nP ' + fmtPct_(w.partnerSharePct, 1), color: C.greenDark, bold: true }
     ], cx - band / 2, plot.y + plot.h + 3, band, 16, { fontSize: 5.5, align: 'CENTER' });
   });
