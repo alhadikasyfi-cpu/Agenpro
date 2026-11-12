@@ -87,7 +87,7 @@ const CORE = {
 
   // Every SawitPRO feature: `terms` find mentions of it in AI text, so each slide's text stays about its own feature.
   FEATURE_TERMS: {
-    'Lapak Sawit': [/lapak\s*sawit/i],
+    'Pasar Sawit': [/pasar\s*sawit/i, /lapak\s*sawit/i],
     'Pricing Intelligence': [/pricing\s*intelligence/i],
     'Affiliate': [/affiliat/i, /afiliasi/i, /referral/i, /toko\s*sawit/i],
     'Protim': [/\bprotim\b/i],
@@ -111,7 +111,7 @@ const CORE = {
 /** Features in slide order. Each Feature_*.gs file defines one of these functions. */
 function FEATURE_REGISTRY_() {
   return [
-    lapakSawitFeature_(),
+    pasarSawitFeature_(),
     pricingIntelligenceFeature_(),
     affiliateFeature_(),
     protimFeature_(),
@@ -126,7 +126,7 @@ function onOpen() {
   FEATURE_REGISTRY_().forEach(f => menu.addItem('Only: ' + f.name, f.menuFunction));
   menu.addSeparator()
     .addItem('Set Gemini API key', 'setGeminiApiKey')
-    .addItem('Open generated presentation', 'openLapakSawitPresentation')
+    .addItem('Open generated presentation', 'openGeneratedPresentation')
     .addToUi();
 }
 
@@ -698,7 +698,7 @@ function setGeminiApiKey() {
   }
 }
 
-function openLapakSawitPresentation() {
+function openGeneratedPresentation() {
   const id = PropertiesService.getScriptProperties().getProperty(CORE.PRESENTATION_PROPERTY);
   if (!id) {
     SpreadsheetApp.getUi().alert('No presentation generated yet.');
@@ -707,7 +707,7 @@ function openLapakSawitPresentation() {
   const url = 'https://docs.google.com/presentation/d/' + id + '/edit';
   SpreadsheetApp.getUi().showModalDialog(
     HtmlService.createHtmlOutput('<p>Open presentation:</p><p><a target="_blank" href="' + url + '">' + url + '</a></p>').setWidth(460).setHeight(130),
-    'Lapak Sawit Presentation'
+    'Feature Analysis Presentation'
   );
 }
 

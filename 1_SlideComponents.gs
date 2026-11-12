@@ -10,7 +10,7 @@
  * Builds a feature from a funnel sheet. def = {
  *   id, name, menuFunction, sheet, description,
  *   app: 'timpro' | 'agenpro'          — fixed app, or
- *   splitByColumn: true                — one slide per app found in the "segment" column (e.g. "Lapak Sawit Agenpro"),
+ *   splitByColumn: true                — one slide per app found in the "segment" column (e.g. "Pasar Sawit Agenpro"),
  *   fields: { date, segment?, dau, <step keys>, newUsers?, returningUsers?, names?, appWau?, featureWau? } → header aliases,
  *   steps: [{ key, label }]            — feature steps in order; the first is "users of the feature",
  *   usersLabel                         — KPI label for the first step's users, e.g. 'USERS OPEN DASHBOARD'
@@ -24,10 +24,11 @@ function createFunnelFeature_(def) {
     menuFunction: def.menuFunction,
     buildSlides: (ss, issues) => {
       const stepKeys = def.steps.map(s => s.key);
-      const table = readTable_(ss, def.sheet, def.fields, ['date', 'dau', stepKeys[0]]);
+      const sheets = [].concat(def.sheet);
+      const table = readTable_(ss, sheets.find(n => ss.getSheetByName(n)) || sheets[0], def.fields, ['date', 'dau', stepKeys[0]]);
       const groups = {};
       table.rows.forEach(r => {
-        const appKey = def.splitByColumn ? appKeyFromText_(r.segment, def.name) : def.app;
+        const appKey = def.splitByColumn ? appKeyFromText_(r.segment) : def.app;
         (groups[appKey] = groups[appKey] || []).push(r);
       });
       return Object.keys(groups).filter(k => CORE.APPS[k]).sort().map(appKey => {
@@ -68,9 +69,10 @@ function createFunnelFeature_(def) {
   };
 }
 
-function appKeyFromText_(text, featureName) {
-  const rest = String(text || '').toLowerCase().replace(featureName.toLowerCase(), '').replace(/[^a-z0-9]+/g, '');
-  return CORE.APPS[rest] ? rest : (/agen/.test(rest) ? 'agenpro' : /tim/.test(rest) ? 'timpro' : rest);
+/** "Lapak Sawit Agenpro" / "Pasar Sawit Timpro" → app key, from the app name at the end of the text. */
+function appKeyFromText_(text) {
+  const t = String(text || '').toLowerCase();
+  return Object.keys(CORE.APPS).find(k => t.replace(/[^a-z0-9]+/g, '').endsWith(k)) || (/agen/.test(t) ? 'agenpro' : /tim/.test(t) ? 'timpro' : t);
 }
 
 function weeklyDefinitions_(def) {
