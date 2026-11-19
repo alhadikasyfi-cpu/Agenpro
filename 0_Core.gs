@@ -168,9 +168,13 @@ function generateFeatures_(ids) {
     const presentation = getOrCreatePresentation_();
     const slides = presentation.getSlides();
     if (!slides.length) throw new Error('Presentation missing master template on Slide 1.');
+    // Cover with the analysis week first, then one slide per spec
+    const cover = slides[0].duplicate();
+    cover.move(1);
+    drawCoverSlide_(cover, specs);
     specs.forEach((spec, i) => {
       const newSlide = slides[0].duplicate();
-      newSlide.move(1 + i);
+      newSlide.move(2 + i);
       spec.draw(newSlide, aiResults[i]);
       if (aiResults[i].speakerNotes) newSlide.getNotesPage().getSpeakerNotesShape().getText().setText(aiResults[i].speakerNotes);
       if (aiResults[i].removedOffTopic) {
@@ -179,7 +183,7 @@ function generateFeatures_(ids) {
     });
 
     presentationUrl = 'https://docs.google.com/presentation/d/' + presentation.getId() + '/edit';
-    const message = specs.length + ' slide(s): ' + specs.map(s => s.title).join(', ') + '.' +
+    const message = 'Cover + ' + specs.length + ' slide(s): ' + specs.map(s => s.title).join(', ') + '.' +
       (failed.length ? ' Skipped: ' + failed.join(' | ') + '.' : '') +
       (warnings.length ? ' Warnings: ' + warnings.join('; ') : '');
     logRun_(ss, failed.length || warnings.length ? 'SUCCESS_WITH_WARNINGS' : 'SUCCESS', message, presentationUrl);

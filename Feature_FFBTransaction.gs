@@ -36,6 +36,11 @@ function ffbTransactionFeature_() {
 
       return [{
         title: title,
+        period: {
+          kind: 'month', label: monthLabel_(report.month), compareLabel: prev ? monthLabel_(prev.month) : '–',
+          dataUntil: lastDate,
+          note: weekly.length ? 'weekly trend to ' + formatShortDate_(weekly[weekly.length - 1].end) + (weekly[weekly.length - 1].estimatedDay ? '*' : '') : ''
+        },
         ai: {
           feature: 'FFB Transaction',
           app: app,

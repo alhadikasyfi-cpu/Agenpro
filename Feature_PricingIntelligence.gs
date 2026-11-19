@@ -65,6 +65,7 @@ function pricingSlideSpec_(ss, src, issues) {
 
   return {
     title: title,
+    period: weekPeriod_(weekly, series),
     ai: {
       feature: 'Pricing Intelligence',
       app: app,

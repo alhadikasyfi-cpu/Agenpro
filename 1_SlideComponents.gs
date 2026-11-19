@@ -45,6 +45,7 @@ function createFunnelFeature_(def) {
         const cmp = weekly.compare;
         return {
           title: title,
+          period: weekPeriod_(weekly, series),
           ai: {
             feature: def.name,
             app: app,
@@ -81,6 +82,14 @@ function dropEstimates_(week) {
     delete w[k];
   });
   return w;
+}
+
+/** Period of a weekly slide, for the cover: this week, last week, estimated day, last date that has real data. */
+function weekPeriod_(weekly, series) {
+  const w = weekly.windows, cur = w[w.length - 1], prev = w.length > 1 ? w[w.length - 2] : null;
+  const real = series.filter(r => !r.estimated);
+  return { kind: 'week', start: cur.start, end: cur.end, prevStart: prev ? prev.start : null, prevEnd: prev ? prev.end : null,
+    estimatedDay: weekly.estimatedDay || null, dataUntil: real.length ? real[real.length - 1].date : null };
 }
 
 /** "Lapak Sawit Agenpro" / "Pasar Sawit Timpro" → app key, from the app name at the end of the text. */
@@ -362,6 +371,70 @@ function retentionStats_(cmp) {
     { text: '   ·   ', color: C.muted },
     { text: fmtNum_(cur.churnedFromPrev) + ' did not return', bold: true, color: C.red }
   ];
+}
+
+/* ------------------------------ COVER ------------------------------ */
+
+/**
+ * First slide of every run: the analysis week (the week most slides cover) with the week it is compared to, and one row
+ * per slide with its own period, so a slide that covers another week or a month is visible at a glance.
+ */
+function drawCoverSlide_(slide, specs) {
+  const C = CORE.COLORS;
+  const weeks = specs.map(s => s.period).filter(p => p && p.kind === 'week');
+  const count = {};
+  weeks.forEach(p => count[p.end] = (count[p.end] || 0) + 1);
+  const mainEnd = Object.keys(count).sort((a, b) => count[b] - count[a] || (a < b ? 1 : -1))[0];
+  const main = weeks.find(p => p.end === mainEnd);
+
+  addText_(slide, 'SAWITPRO FEATURE ANALYSIS', 40, 66, 400, 10, { fontSize: 7, bold: true, color: C.muted });
+  addText_(slide, 'Weekly Feature Review', 40, 78, 400, 26, { fontSize: 22, bold: true, color: C.greenDark, valign: 'MIDDLE' });
+  addText_(slide, 'Generated ' + longDate_(dateKey_(new Date())), 40, 106, 400, 10, { fontSize: 7, color: C.muted });
+
+  // Analysis week
+  const box = { x: 420, y: 64, w: 260, h: 60 };
+  rect_(slide, SlidesApp.ShapeType.ROUND_RECTANGLE, box.x, box.y, box.w, box.h, C.greenDark);
+  rect_(slide, SlidesApp.ShapeType.RECTANGLE, box.x, box.y + 10, 3, box.h - 20, C.yellow);
+  addText_(slide, 'ANALYSIS WEEK (THU–WED)', box.x + 14, box.y + 7, box.w - 24, 9, { fontSize: 6.5, bold: true, color: C.greenMuted });
+  addText_(slide, main ? longDate_(main.start, true) + ' – ' + longDate_(main.end, true) : '–', box.x + 14, box.y + 18, box.w - 24, 18,
+    { fontSize: 12.5, bold: true, color: C.white, valign: 'MIDDLE' });
+  addText_(slide, main && main.prevStart ? 'compared with ' + formatRange_(main.prevStart, main.prevEnd) + ' (previous week)' : '',
+    box.x + 14, box.y + 39, box.w - 24, 9, { fontSize: 6.5, color: C.greenMuted });
+
+  // One row per slide
+  const t = { x: 40, y: 140, w: 640 };
+  const col = { slide: t.x + 8, period: t.x + 230, compare: t.x + 360, note: t.x + 470 };
+  rect_(slide, SlidesApp.ShapeType.RECTANGLE, t.x, t.y, t.w, 16, C.greenSoft);
+  [['SLIDE', col.slide], ['PERIOD', col.period], ['COMPARED WITH', col.compare], ['DATA', col.note]].forEach(h =>
+    addText_(slide, h[0], h[1], t.y, 120, 16, { fontSize: 6, bold: true, color: C.greenDark, valign: 'MIDDLE' }));
+  const rowH = Math.min(20, (360 - t.y - 16 - 22) / Math.max(1, specs.length));
+  specs.forEach((s, i) => {
+    const y = t.y + 16 + i * rowH, p = s.period || {};
+    if (i % 2) rect_(slide, SlidesApp.ShapeType.RECTANGLE, t.x, y, t.w, rowH, C.cardBg);
+    const off = p.kind === 'week' && main && p.end !== main.end;
+    addText_(slide, (i + 2) + '.  ' + s.title, col.slide, y, col.period - col.slide - 6, rowH, { fontSize: 7.5, bold: true, color: C.ink, valign: 'MIDDLE' });
+    const period = p.kind === 'week' ? formatRange_(p.start, p.end) + (p.estimatedDay ? '*' : '')
+      : p.kind === 'month' ? p.label : '–';
+    addText_(slide, period, col.period, y, col.compare - col.period - 6, rowH, { fontSize: 7.5, bold: true, color: off ? C.red : p.estimatedDay ? C.amber : C.ink, valign: 'MIDDLE' });
+    const cmp = p.kind === 'week' ? (p.prevStart ? formatRange_(p.prevStart, p.prevEnd) : '–') : p.compareLabel || '–';
+    addText_(slide, cmp, col.compare, y, col.note - col.compare - 6, rowH, { fontSize: 7, color: C.muted, valign: 'MIDDLE' });
+    const notes = [];
+    if (p.dataUntil) notes.push('sheet until ' + formatShortDate_(p.dataUntil));
+    if (p.estimatedDay) notes.push(formatShortDate_(p.estimatedDay) + ' est.');
+    if (p.note) notes.push(p.note);
+    if (off) notes.push('older week');
+    addText_(slide, notes.join(' · '), col.note, y, t.x + t.w - col.note - 4, rowH, { fontSize: 6.5, color: off ? C.red : p.estimatedDay ? C.amber : C.muted, valign: 'MIDDLE' });
+  });
+  hLine_(slide, t.x, t.x + t.w, t.y + 16 + specs.length * rowH, C.border, 0.75);
+  addText_(slide, 'Weeks run Thursday–Wednesday.  * = the last day of the week is estimated (average of the week so far) because the ' +
+    'sheet is not updated yet.', t.x, t.y + 22 + specs.length * rowH, t.w, 9, { fontSize: 6, color: C.muted });
+}
+
+/** "Thu, 12 Nov 2026" (withDay) or "12 Nov 2026". */
+function longDate_(key, withDay) {
+  const d = parseDate_(key);
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  return (withDay ? days[d.getDay()] + ' ' : '') + Utilities.formatDate(d, Session.getScriptTimeZone(), 'd MMM yyyy');
 }
 
 /* ------------------------------ SLIDE COMPONENTS ------------------------------ */
