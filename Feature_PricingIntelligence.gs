@@ -1,14 +1,17 @@
 /**
- * Pricing Intelligence (AgenPRO) — weekly review, the effect of moving the price list to Home, and price coverage.
- * Sheet "Pricing Intelligence Agenpro" holds two tables side by side:
+ * Pricing Intelligence — one slide per app: weekly review, the effect of moving the price list to Home, and price coverage.
+ * Each sheet ("Pricing Intelligence Agenpro", "Pricing Intelligence Timpro") holds two tables side by side:
  *   A–G  daily usage: Date, App DAU, Feature DAU, First Time Feature Users, Returning Users, Weekly App (WAU), Weekly Feature (WAU)
  *   K–R  update frequency of the mill & ramp master list, one row per category × segment (PARTNER-MILLS, NON-PARTNER-MILLS,
  *        RAMP): count, % within category, % of master, min / max / median latest price
  */
 
 const PI_CONFIG = {
-  SHEET: 'Pricing Intelligence Agenpro',
-  APP: 'agenpro',
+  // One slide per sheet that exists
+  SOURCES: [
+    { sheet: 'Pricing Intelligence Agenpro', app: 'agenpro' },
+    { sheet: 'Pricing Intelligence Timpro', app: 'timpro' }
+  ],
   // The price list moved from a menu to the home screen on this date
   CHANGE_DATE: '2026-10-30',
   CHANGE_LABEL: 'Price list moved to Home',
@@ -29,65 +32,73 @@ function pricingIntelligenceFeature_() {
     name: 'Pricing Intelligence',
     menuFunction: 'generatePricingIntelligenceSlides',
     buildSlides: (ss, issues) => {
-      const app = CORE.APPS[PI_CONFIG.APP];
-      const tag = app.label + ' ';
-      const daily = readTable_(ss, PI_CONFIG.SHEET, {
-        // Exact headers first, then patterns so small renames ("Total App DAU", "Weekly App DAU (WAU)") still match
-        date: ['date', 'tanggal'],
-        dau: ['app_dau', 'total_app_dau', 'daily_active_users', /^(total_)?app_dau$/],
-        feature: ['feature_dau', 'total_feature_dau', /^(total_)?feature_dau$/],
-        newUsers: ['first_time_feature_users', 'new_users', /first_time/],
-        returningUsers: ['returning_users', 'existing_returning_feature_users', /returning/],
-        appWau: ['weekly_app_wau', 'weekly_app_dau_wau', 'app_weekly_active_user', /app.*wau$/],
-        featureWau: ['weekly_feature_wau', 'weekly_feature_dau_wau', 'feature_weekly_active_user', /feature.*wau$/]
-      }, ['date', 'dau', 'feature']);
-      const series = toDailySeries_(daily.rows, ['feature'], tag, issues);
-      const weekly = weeklyAnalysis_(series, ['feature'], tag, issues);
-      if (!weekly) throw new Error('needs at least one complete week (Thu–Wed) of data');
-
-      const coverage = readCoverage_(ss, issues);
-      const change = beforeAfter_(series, PI_CONFIG.CHANGE_DATE);
-      const title = 'Pricing Intelligence · ' + app.label;
-      const cmp = weekly.compare;
-
-      return [{
-        title: title,
-        ai: {
-          feature: 'Pricing Intelligence',
-          app: app,
-          description: 'Shows the latest FFB/TBS buying prices of mills and ramps (partner and non-partner) so users know where to ' +
-            'deliver their fruit and at what price today. On ' + formatShortDate_(PI_CONFIG.CHANGE_DATE) + ' the price list moved from a ' +
-            'menu to the home screen, so users now see prices without opening the detail page.',
-          scope: [
-            'Weekly review of Pricing Intelligence in AgenPRO: this week vs last week (Thursday–Wednesday), the before/after effect ' +
-              'of moving the price list to Home, and price coverage: how many mills and ramps update their prices regularly, ' +
-              'compared between partner mills, non-partner mills and ramps.',
-            'Describe how detail users changed after the move to Home (prices are now visible on Home without opening the detail), ' +
-              'and recommend product changes that make the Home price list more useful and bring users to the detail when it adds value.'
-          ],
-          definitions: {
-            appWau: 'AgenPRO weekly active users',
-            clickUsers: 'distinct users who opened the Pricing Intelligence detail during the week (NOT WAU)',
-            conversionPct: 'clickUsers ÷ appWau',
-            'beforeAfter.before / after': 'equal-length periods right before and from the move to Home; avgFeatureUsers = detail users per day',
-            'coverage.segments': 'partner mills, non-partner mills and ramps in the master list; byCategory = how often they update ' +
-              'their price (count, % of the segment, latest price range in Rp/kg)',
-            'coverage.regular / regularPct': 'mills & ramps updating at least monthly (≤ 30 days), overall and per segment'
-          },
-          payload: {
-            weeks: weekly.weeks,
-            thisWeekVsLastWeek: cmp,
-            estimatedDay: weekly.estimatedDay,
-            beforeAfter: change,
-            coverage: coverage,
-            daily: series.map(r => ({ date: r.date, estimated: r.estimated || undefined, dau: r.dau, detailUsers: r.steps.feature, firstTime: r.newUsers, returning: r.returningUsers })),
-            dataQualityIssues: issues.slice()
-          },
-          fallbackHeadline: title + ': ' + fmtNum_(cmp.current.clickUsers) + ' detail users this week.'
-        },
-        draw: (slide, ai) => drawPricingSlide_(slide, app, series, weekly, change, coverage, ai, issues.length)
-      }];
+      const sources = PI_CONFIG.SOURCES.filter(src => ss.getSheetByName(src.sheet));
+      if (!sources.length) throw new Error('no sheet found: ' + PI_CONFIG.SOURCES.map(src => src.sheet).join(', '));
+      return sources.map(src => pricingSlideSpec_(ss, src, issues));
     }
+  };
+}
+
+/** Slide spec for one app's Pricing Intelligence sheet. */
+function pricingSlideSpec_(ss, src, issues) {
+  const app = CORE.APPS[src.app];
+  const tag = app.label + ' ';
+  const appIssues = () => issues.filter(i => i.indexOf(tag) === 0);
+  const daily = readTable_(ss, src.sheet, {
+    // Exact headers first, then patterns so small renames ("Total App DAU", "Weekly App DAU (WAU)") still match
+    date: ['date', 'tanggal'],
+    dau: ['app_dau', 'total_app_dau', 'daily_active_users', /^(total_)?app_dau$/],
+    feature: ['feature_dau', 'total_feature_dau', /^(total_)?feature_dau$/],
+    newUsers: ['first_time_feature_users', 'new_users', /first_time/],
+    returningUsers: ['returning_users', 'existing_returning_feature_users', /returning/],
+    appWau: ['weekly_app_wau', 'weekly_app_dau_wau', 'app_weekly_active_user', /app.*wau$/],
+    featureWau: ['weekly_feature_wau', 'weekly_feature_dau_wau', 'feature_weekly_active_user', /feature.*wau$/]
+  }, ['date', 'dau', 'feature']);
+  const series = toDailySeries_(daily.rows, ['feature'], tag, issues);
+  const weekly = weeklyAnalysis_(series, ['feature'], tag, issues);
+  if (!weekly) throw new Error('needs at least one complete week (Thu–Wed) of data');
+
+  const coverage = readCoverage_(ss, src.sheet, tag, issues);
+  const change = beforeAfter_(series, PI_CONFIG.CHANGE_DATE);
+  const title = 'Pricing Intelligence · ' + app.label;
+  const cmp = weekly.compare;
+
+  return {
+    title: title,
+    ai: {
+      feature: 'Pricing Intelligence',
+      app: app,
+      description: 'Shows the latest FFB/TBS buying prices of mills and ramps (partner and non-partner) so users know where to ' +
+        'deliver their fruit and at what price today. On ' + formatShortDate_(PI_CONFIG.CHANGE_DATE) + ' the price list moved from a ' +
+        'menu to the home screen, so users now see prices without opening the detail page.',
+      scope: [
+        'Weekly review of Pricing Intelligence in ' + app.label + ': this week vs last week (Thursday–Wednesday), the before/after effect ' +
+          'of moving the price list to Home, and price coverage: how many mills and ramps update their prices regularly, ' +
+          'compared between partner mills, non-partner mills and ramps.',
+        'Describe how detail users changed after the move to Home (prices are now visible on Home without opening the detail), ' +
+          'and recommend product changes that make the Home price list more useful and bring users to the detail when it adds value.'
+      ],
+      definitions: {
+        appWau: app.label + ' weekly active users',
+        clickUsers: 'distinct users who opened the Pricing Intelligence detail during the week (NOT WAU)',
+        conversionPct: 'clickUsers ÷ appWau',
+        'beforeAfter.before / after': 'equal-length periods right before and from the move to Home; avgFeatureUsers = detail users per day',
+        'coverage.segments': 'partner mills, non-partner mills and ramps in the master list; byCategory = how often they update ' +
+          'their price (count, % of the segment, latest price range in Rp/kg)',
+        'coverage.regular / regularPct': 'mills & ramps updating at least monthly (≤ 30 days), overall and per segment'
+      },
+      payload: {
+        weeks: weekly.weeks,
+        thisWeekVsLastWeek: cmp,
+        estimatedDay: weekly.estimatedDay,
+        beforeAfter: change,
+        coverage: coverage,
+        daily: series.map(r => ({ date: r.date, estimated: r.estimated || undefined, dau: r.dau, detailUsers: r.steps.feature, firstTime: r.newUsers, returning: r.returningUsers })),
+        dataQualityIssues: appIssues()
+      },
+      fallbackHeadline: title + ': ' + fmtNum_(cmp.current.clickUsers) + ' detail users this week.'
+    },
+    draw: (slide, ai) => drawPricingSlide_(slide, app, series, weekly, change, coverage, ai, appIssues().length)
   };
 }
 
@@ -100,13 +111,13 @@ function generatePricingIntelligenceSlides() {
  * the "Kategori Frekuensi Update" header onwards: the segment column is the one holding text such as PARTNER-MILLS, the
  * count is the numeric "Jumlah …" column, and the price columns are matched by their Min / Max / Median headers.
  */
-function readCoverage_(ss, issues) {
-  const sheet = ss.getSheetByName(PI_CONFIG.SHEET);
+function readCoverage_(ss, sheetName, tag, issues) {
+  const sheet = ss.getSheetByName(sheetName);
   const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
   const headers = values[0].map(normalizeHeader_);
   const c0 = headers.indexOf('kategori_frekuensi_update');
   if (c0 < 0) {
-    issues.push('coverage table not found (no "Kategori Frekuensi Update" column)');
+    issues.push(tag + 'coverage table not found (no "Kategori Frekuensi Update" column)');
     return null;
   }
   const rows = [];
@@ -118,7 +129,7 @@ function readCoverage_(ss, issues) {
   const priceCol = re => cols.find(j => re.test(headers[j]));
   const at = { min: priceCol(/^min_harga/), max: priceCol(/^max_harga/), median: priceCol(/^median_harga/) };
   if (countCol == null) {
-    issues.push('coverage table: no count column');
+    issues.push(tag + 'coverage table: no count column');
     return null;
   }
 

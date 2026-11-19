@@ -192,23 +192,18 @@ function monthLabel_(key) {
 
 /** Complete Thursday–Wednesday weeks: kg and transactions per type. */
 function weeklyFfb_(tx) {
-  // Sheet stops one day before the week ends: estimate that day per type from the same weekday of earlier weeks
+  // Sheet stops one day before the week ends: estimate that day per type as the average day of this week so far
   let est = null;
   const lastKey = tx[tx.length - 1].date;
   const target = addDays_(parseDate_(lastKey), 1);
   if (CORE.ESTIMATE_MISSING_LAST_DAY && target.getDay() === (CORE.WEEK_START_DAY + 6) % 7) {
-    const days = [];
-    for (let k = 1; k <= CORE.ESTIMATE_LOOKBACK_WEEKS; k++) {
-      const d = dateKey_(addDays_(target, -7 * k));
-      if (d >= tx[0].date) days.push(d);
-    }
-    if (days.length) {
-      est = { date: dateKey_(target) };
-      FFB_CONFIG.TYPES.forEach(type => {
-        const list = tx.filter(t => t.type === type && days.indexOf(t.date) >= 0);
-        est[type] = { kg: Math.round(list.reduce((a, t) => a + t.kg, 0) / days.length), tx: Math.round(list.length / days.length) };
-      });
-    }
+    const from = dateKey_(addDays_(target, -6));
+    const days = Math.round((parseDate_(lastKey) - parseDate_(from)) / 86400000) + 1;
+    est = { date: dateKey_(target) };
+    FFB_CONFIG.TYPES.forEach(type => {
+      const list = tx.filter(t => t.type === type && t.date >= from && t.date <= lastKey);
+      est[type] = { kg: Math.round(list.reduce((a, t) => a + t.kg, 0) / days), tx: Math.round(list.length / days) };
+    });
   }
   return weekWindows_(tx[0].date, est ? est.date : lastKey).map(w => {
     const list = tx.filter(t => t.date >= w.start && t.date <= w.end);

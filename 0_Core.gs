@@ -358,7 +358,6 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
       nameDays: nameDays
     };
     const wk = tag + 'week ' + formatRange_(w.start, w.end);
-    if (raw.days < 7) issues.push(wk + ': only ' + raw.days + ' of 7 days have data');
     if (raw.appWau == null && raw.days === 7) issues.push(wk + ': app WAU is empty on the last day of the week');
     // Weekly distinct users of later steps, when the sheet has them (filled on the week's last day)
     raw.stepWau = {};
@@ -439,7 +438,7 @@ function weeklyAnalysis_(series, stepKeys, tag, issues) {
 /** Complete weeks, oldest first, from WEEK_START_DAY; the latest one ends on or before lastKey. */
 /**
  * If the series ends exactly one day before a week's last day, adds an estimated row for that day (in place) so the week
- * is complete. Daily values = average of the same weekday in the previous weeks. Weekly app / feature WAU = this week's
+ * is complete. Daily values = average of the days this week already has. Weekly app / feature WAU = this week's
  * first six days scaled by how the full-week WAU related to the first six days in earlier weeks. The row has no user
  * names; `retainedScale` does the same for "came back from last week". Returns null when nothing is estimated.
  */
@@ -459,8 +458,9 @@ function estimateMissingLastDay_(series, stepKeys) {
   if (!lookback.length) return null;
 
   const mean = list => (list.length ? list.reduce((a, v) => a + v, 0) / list.length : null);
-  const sameDay = get => {
-    const vals = lookback.map(d => get(byDate[d])).filter(v => v != null);
+  // Daily values of the missing day = average of the days this week already has
+  const weekAvg = get => {
+    const vals = daysOf(date, 6).map(get).filter(v => v != null);
     return vals.length ? Math.round(mean(vals)) : null;
   };
   const daysOf = (endKey, n) => {
@@ -483,14 +483,14 @@ function estimateMissingLastDay_(series, stepKeys) {
   const sumDau = rows => rows.reduce((a, r) => a + r.dau, 0);
   const hasNames = series.some(r => r.names.length);
   const steps = {};
-  stepKeys.forEach(k => steps[k] = sameDay(r => r.steps[k]) || 0);
+  stepKeys.forEach(k => steps[k] = weekAvg(r => r.steps[k]) || 0);
   const row = {
     date: date,
     estimated: true,
-    dau: sameDay(r => r.dau) || 0,
+    dau: weekAvg(r => r.dau) || 0,
     steps: steps,
-    newUsers: sameDay(r => r.newUsers),
-    returningUsers: sameDay(r => r.returningUsers),
+    newUsers: weekAvg(r => r.newUsers),
+    returningUsers: weekAvg(r => r.returningUsers),
     names: [],
     stepWau: {},
     appWau: null,
